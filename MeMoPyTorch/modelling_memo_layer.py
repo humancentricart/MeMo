@@ -227,10 +227,17 @@ class MeMoLayer(Module):
         # dimension = (blocks,1)
         batch_size = sequence_encoding.shape[0]
         all_sequences = torch.sum(sequence_encoding, dim=1)
-        all_sequences = all_sequences.reshape(batch_size, self.d, 1)
+        # OLD : all_sequences = all_sequences.reshape(batch_size, self.d, 1)
         #print(all_sequences.shape) #(batch_size, d, 1)
+
+        all_sequences = torch.sum(all_sequences, dim=0)
+        all_sequences = all_sequences.reshape( self.d, 1)
+        #print(all_sequences.shape) #(batch_size, d, 1)
+
        
         stored_sequences_filter = 1 - torch.round(torch.matmul(self.CMM(seq_enc_per_token), all_sequences))
+        stored_sequences_filter[stored_sequences_filter < 0] = 0.0 # Sequences may appear more than once in all_sequences
+        
         #print(stored_sequences_filter.shape)
         new_sequences = torch.round(torch.matmul(sequence_encoding, all_sequences))
         #print(new_sequences.shape)
@@ -244,6 +251,8 @@ class MeMoLayer(Module):
         penalizing_factors[penalizing_factors == -math.inf] = 0
     
         return sequence_encoding * penalizing_factors
+
+    
     
     # The most simple implementation
     # Input sequence is has a shape of (self.h,self.d), that is self.h sequences are proposed as input rows
