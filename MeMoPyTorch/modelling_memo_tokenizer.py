@@ -127,33 +127,39 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
         return input_ids, labels
 
 
-    def get_memo_input(self, batch_input_ids):
-        memo_input = {}
-        for i in range(self.head_number):
-            end = batch_input_ids['input_ids'].shape[-1] - i
-            start = max(0, end - self.max_length)
-            
-            if start > 0 and i == 0:
-                print(f"Truncation enabled input = {batch_input_ids['input_ids'].shape} vs {self.max_length}")
+    #def get_memo_input(self, batch_input_ids):
+    #    memo_input = {}
+    #    for i in range(self.head_number):
+    #        end = batch_input_ids['input_ids'].shape[-1] - i
+    #        start = max(0, end - self.max_length)
+    #        
+    #        if start > 0 and i == 0:
+    #            print(f"Truncation enabled input = {batch_input_ids['input_ids'].shape} vs {self.max_length}")
 
-            input_ids = batch_input_ids['input_ids'][..., start:end]
-            #labels = batch_input_ids['input_ids'][..., start+1:end]
-            
-            if input_ids.shape[-1] != self.max_length:
-                input_ids = self.pad({'input_ids':input_ids}, max_length=self.max_length, padding='max_length')
-                input_ids = input_ids['input_ids']
-            
-            memo_input[i] = {'input_ids': input_ids[..., :-1], 
-                             'labels': input_ids[..., 1:]}
-        
+    #        input_ids = batch_input_ids['input_ids'][..., start:end]
+    #        #labels = batch_input_ids['input_ids'][..., start+1:end]
+    #        
+    #        if input_ids.shape[-1] != self.max_length:
+    #            input_ids = self.pad({'input_ids':input_ids}, max_length=self.max_length, padding='max_length')
+    #            input_ids = input_ids['input_ids']
+    #        
+    #        memo_input[i] = {'input_ids': input_ids[..., :-1], 
+    #                         'labels': input_ids[..., 1:]}
+    #    
+    #    return memo_input
+
+    def get_memo_input(self, input_ids):
+        input_ids = input_ids['input_ids']
+        memo_input = {'input_ids': input_ids[..., :-1], 'labels': input_ids[..., 1:]}
         return memo_input
+        
     
-    def memo_heads_encode(self, text: Union[str, List[str], List[List[str]]] = None, 
-               padding='max_length', truncation=True, max_length=None):
-        
-        batch_input_ids = self.__call__(text, padding=padding, truncation=truncation, max_length=max_length)
-        memo_input = self.get_memo_input(batch_input_ids)
-        return memo_input
+    #def memo_heads_encode(self, text: Union[str, List[str], List[List[str]]] = None, 
+    #           padding='max_length', truncation=True, max_length=None):
+    #    
+    #    batch_input_ids = self.__call__(text, padding=padding, truncation=truncation, max_length=max_length)
+    #    memo_input = self.get_memo_input(batch_input_ids)
+    #    return memo_input
 
 
     def get_text_batch_encoding(self, text: Union[str, List[str], List[List[str]]] = None, 

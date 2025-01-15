@@ -192,7 +192,10 @@ class MeMoLayer(Module):
 
         self.W_v_single_head = ProjectionTokens(self.d, self.d_k, init_weights=init_weights)
         self.Prj = ProjectionSequence(self.d, self.d*self.h, init_weights=init_weights)
+        # CMM : correlation matrix memory for the specific layer
         self.CMM = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
+        # CMM OUT : correlation matrix memory for the specific layer
+        #self.CMM_OUT = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
 
     def _init_weights(self):
         self.reset_parameters()
@@ -226,14 +229,18 @@ class MeMoLayer(Module):
         # sequences in the current CMM
         # dimension = (blocks,1)
         batch_size = sequence_encoding.shape[0]
+        
         all_sequences = torch.sum(sequence_encoding, dim=1)
         # OLD : all_sequences = all_sequences.reshape(batch_size, self.d, 1)
         #print(all_sequences.shape) #(batch_size, d, 1)
-
         all_sequences = torch.sum(all_sequences, dim=0)
-        all_sequences = all_sequences.reshape( self.d, 1)
-        #print(all_sequences.shape) #(batch_size, d, 1)
 
+        # as in MeMoCMM
+        #all_sequences = torch.sum(sequence_encoding, dim=0)
+
+        
+        all_sequences = all_sequences.reshape(self.d, 1)
+        #print(all_sequences.shape) #(batch_size, d, 1)
        
         stored_sequences_filter = 1 - torch.round(torch.matmul(self.CMM(seq_enc_per_token), all_sequences))
         stored_sequences_filter[stored_sequences_filter < 0] = 0.0 # Sequences may appear more than once in all_sequences
@@ -267,7 +274,10 @@ class MeMoLayer(Module):
             self.CMM.memorize(CMM_update)
             
         #### To be adjusted for taking into consideration the entire sequence
-        seq_enc_plus_out = torch.matmul(torch.transpose(seq_enc_per_token,-2,-1), output_symbols) ## Key (sequenze di h token) x Value ==> matrice??
+        seq_enc_plus_out = torch.matmul(torch.transpose(seq_enc_per_token,-2,-1), output_symbols) 
+        ## Key (sequenze di h token) x Value ==> matrice??
+        #self.CMM_OUT.memorize(seq_enc_plus_out)
+        
         return sequence_encoding, seq_enc_plus_out
     
     def directly_memorize(self, input_sequence):
@@ -285,7 +295,8 @@ class MeMoLayer(Module):
 
 
         #### To be adjusted for taking into consideration the entire sequence
-        seq_enc_plus_out = torch.matmul(torch.transpose(seq_enc_per_token,-2,-1), output_symbols) ## Key (sequenze di h token) x Value ==> matrice??
+        seq_enc_plus_out = torch.matmul(torch.transpose(seq_enc_per_token,-2,-1), output_symbols) 
+        ## Key (sequenze di h token) x Value ==> matrice??
         return sequence_encoding, seq_enc_plus_out
 
     def directly_forget(self, input_sequence):
@@ -314,8 +325,9 @@ class MeMoLayer(Module):
         #    if torch.max(out1).item() > 1.5 or torch.max(out).item()> 1.5:
         #        print("Errore")
         # last token seq_enc_per_token[-1].reshape(batch_size,self.d)
+        #locally_predicted = self.CMM_OUT(seq_enc_per_token[-1].reshape(1,self.d))
 
-        return retrieved_sequence_encoding, seq_enc_per_token[:, -1].reshape(batch_size,self.d)
+        return retrieved_sequence_encoding, seq_enc_per_token[:, -1].reshape(batch_size,self.d)#, locally_predicted
          
 
     def directly_retrieve(self,vector):
