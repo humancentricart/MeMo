@@ -192,7 +192,10 @@ class MeMoLayer(Module):
 
         self.W_v_single_head = ProjectionTokens(self.d, self.d_k, init_weights=init_weights)
         self.Prj = ProjectionSequence(self.d, self.d*self.h, init_weights=init_weights)
+        # CMM : correlation matrix memory for the specific layer
         self.CMM = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
+        # CMM OUT : correlation matrix memory for the specific layer
+        #self.CMM_OUT = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
 
     def _init_weights(self):
         self.reset_parameters()
@@ -231,7 +234,7 @@ class MeMoLayer(Module):
         #print(all_sequences.shape) #(batch_size, d, 1)
 
         all_sequences = torch.sum(all_sequences, dim=0)
-        all_sequences = all_sequences.reshape( self.d, 1)
+        all_sequences = all_sequences.reshape(self.d, 1)
         #print(all_sequences.shape) #(batch_size, d, 1)
 
        
