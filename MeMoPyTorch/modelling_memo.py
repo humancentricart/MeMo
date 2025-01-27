@@ -35,7 +35,7 @@ class MeMo(Module):
         self.device = device if device is not None else DEVICE
         
         self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, device=self.device)
-        self.layers = ModuleList([MeMoLayer(self.d, self.h) for _ in range(num_of_layers)])
+        self.layers = ModuleList([MeMoLayer(self.d, self.h, is_last=(i +1 == num_of_layers)) for i in range(num_of_layers)])
 
         self.to(self.device)
     
@@ -75,7 +75,7 @@ class MeMo(Module):
                 
                 if DEBUGGING:
                     retreived_output_symbol_vector, max_value = self.encoder.decode(output_symbols)
-                    #print(retreived_output_symbol_vector)
+                    print(f"Layer {layer_level} - Output Sequence: {retreived_output_symbol_vector}")
                 
                 ## update the input sequence for the next layer
                 input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].memorize(input_sequence, 
@@ -122,7 +122,7 @@ class MeMo(Module):
                                 
                 if DEBUGGING:
                     retreived_output_symbol_vector, max_value = self.encoder.decode(output_symbols)
-                    #print(retreived_output_symbol_vector)
+                    print(retreived_output_symbol_vector)
                 
                 input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].forget(input_sequence, 
                                                                                                   output_symbols, 
@@ -146,10 +146,10 @@ class MeMo(Module):
         last_layer = self.layers[self.l-1]
 
         (batch_size, current_length, d) = input_sequence.shape
-        assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
+        assert (current_length == self.max_len), f'check tokenization of input text, expected row of {self.max_len} tokens'
         
         encoding_for_the_last_layer = torch.zeros((batch_size, self.d)).to(self.device)
-        current_length = self.chunk_length #min(self.chunk_length, self.max_len)
+        current_length = self.max_len #min(self.chunk_length, self.max_len)
 
         # TODO moved outside the logic for tokenization, here only assertiion above
         #if len(input_sequence) > current_length:
@@ -178,4 +178,6 @@ class MeMo(Module):
             #    #print((retreived_output_symbol_vector, score_max))
 
         retreived_output_symbol_vector, score_max = self.encoder.decode(last_layer.directly_retrieve(encoding_for_the_last_layer))
+        if min(score_max) < 0.1:
+            print(f"Symbol: {retreived_output_symbol_vector} {score_max}")
         return retreived_output_symbol_vector, score_max
