@@ -347,7 +347,7 @@ class MeMoLayer(Module):
         sequence_encoding, seq_enc_per_token = self.get_projections(input_sequence, blocks, h, d)
         
         # Updating local CMM
-        if not is_last and completely:
+        if not is_last and completely and self.use_local_CMM:
             surviving_vectors = self.penalize(sequence_encoding, seq_enc_per_token)
             CMM_update = torch.matmul(torch.transpose(seq_enc_per_token, -2, -1), surviving_vectors)
             self.CMM.forget(CMM_update)

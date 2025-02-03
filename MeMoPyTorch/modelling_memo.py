@@ -178,6 +178,7 @@ class MeMo(Module):
             #    #print((retreived_output_symbol_vector, score_max))
 
         retreived_output_symbol_vector, score_max = self.encoder.decode(last_layer.directly_retrieve(encoding_for_the_last_layer))
-        if min(score_max) < 0.1:
-            print(f"Symbol: {retreived_output_symbol_vector} {score_max}")
+        if DEBUGGING:
+            if min(score_max) < 0.1:
+                print(f"Symbol: {retreived_output_symbol_vector} {score_max}")
         return retreived_output_symbol_vector, score_max
