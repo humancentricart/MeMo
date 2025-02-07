@@ -20,6 +20,8 @@ import numpy as np
 
 # as in Linear torch.nn.modules.linear
 
+import torch.nn.functional as F
+
 
 DEBUGGING = False
 verbose = False
@@ -186,12 +188,15 @@ class CorrelationMatrixMemory(Module):
         with torch.no_grad():
             self.weight -= update #in place update
 
-
+from enum import Enum
+class CompositionOp(Enum):
+    JLT = 1
+    Prod = 2
 
 
 class MeMoLayer(Module):
     
-    def __init__(self, inner_dim, num_of_heads, init_weights=True, is_last=False, alpha=1, **kwargs):
+    def __init__(self, inner_dim, num_of_heads, init_weights=True, is_last=False, alpha=1, compositionOp=CompositionOp.JLT, **kwargs):
         super().__init__()
 
         self.alpha = alpha # Computed vs. memorized sequence encoding (alpha = 1 only computed)
@@ -203,7 +208,7 @@ class MeMoLayer(Module):
 
         self.W_v_single_head = ProjectionTokens(self.d, self.d_k, init_weights=init_weights)
         self.use_local_CMM = (alpha < 1)
-        
+        self.compOp = compositionOp
         
         self.Prj = ProjectionSequence(self.d, self.d*self.h, init_weights=init_weights)
         # CMM : correlation matrix memory for the specific layer
@@ -227,8 +232,14 @@ class MeMoLayer(Module):
         # shape (blocks,self.d)
         #print(input_sequence.reshape((blocks,self.d * self.h)).shape)
         batch_size = input_sequence.shape[0]
-        
-        sequence_encoding = self.Prj(input_sequence.reshape((batch_size, blocks, self.d * self.h)))
+        if self.compOp == CompositionOp.Prod:
+            sequence_encoding = torch.prod(input_sequence,2)
+            sequence_encoding = F.normalize(sequence_encoding, p=2, dim=1)
+            
+        elif self.compOp == CompositionOp.JLT:
+            sequence_encoding = self.Prj(input_sequence.reshape((batch_size, blocks, self.d * self.h)))
+        else: 
+            print("ERROR")
         # shape (blocks,self.d)
         seq_enc_per_token = self.W_v_single_head(input_sequence) / math.sqrt(self.h)
         seq_enc_per_token = seq_enc_per_token.reshape((batch_size, blocks, self.d))

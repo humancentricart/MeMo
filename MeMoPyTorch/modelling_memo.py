@@ -7,9 +7,11 @@ from torch.nn.parameter import Parameter
 
 from .modelling_memo_embedding import MeMoEmbedding
 from .modelling_memo_layer import MeMoLayer
+from .modelling_memo_layer import CompositionOp
 from .modelling_memo_exception import MeMoException
 
 import math
+
 
 
 DEBUGGING = False
@@ -19,7 +21,7 @@ DEVICE = 'cpu'
 
 class MeMo(Module):
     def __init__(self, inner_dim, num_of_heads, num_of_layers, chunk_length, 
-                 num_embeddings, padding_idx=0, device=None):
+                 num_embeddings, padding_idx=0, device=None, alpha_gen = 1, compositionOp = CompositionOp.Prod):
         super().__init__()
         
         self.d = inner_dim
@@ -35,7 +37,7 @@ class MeMo(Module):
         self.device = device if device is not None else DEVICE
         
         self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, device=self.device)
-        self.layers = ModuleList([MeMoLayer(self.d, self.h, is_last=(i +1 == num_of_layers)) for i in range(num_of_layers)])
+        self.layers = ModuleList([MeMoLayer(self.d, self.h, alpha=alpha_gen, compositionOp = compositionOp, is_last=(i +1 == num_of_layers)) for i in range(num_of_layers)])
 
         self.to(self.device)
     
