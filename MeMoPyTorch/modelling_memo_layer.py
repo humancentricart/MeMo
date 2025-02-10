@@ -234,7 +234,7 @@ class MeMoLayer(Module):
         batch_size = input_sequence.shape[0]
         if self.compOp == CompositionOp.Prod:
             sequence_encoding = torch.prod(input_sequence,2)
-            sequence_encoding = F.normalize(sequence_encoding, p=2, dim=1)
+            sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
             
         elif self.compOp == CompositionOp.JLT:
             sequence_encoding = self.Prj(input_sequence.reshape((batch_size, blocks, self.d * self.h)))
