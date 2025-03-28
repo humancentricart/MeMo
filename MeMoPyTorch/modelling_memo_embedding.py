@@ -196,6 +196,8 @@ class MeMoEmbedding(Embedding):
         ### MeMo initilialization
         print("MeMo embedding initilialization")
         init.normal_(self.weight, mean=self.mean, std=self.std) # TODO add generator?
+        #print(f"SHAPE: {self.weight.shape}")
+        #self.weight.data = self.weight.data.view(-1)[torch.randperm(self.weight.data.numel())].reshape(self.weight.data.shape)
         
         self._fill_padding_idx_with_zero()
 

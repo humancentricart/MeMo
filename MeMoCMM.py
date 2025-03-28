@@ -278,9 +278,9 @@ class MeMoLayer:
 
         locally_predicted = torch.matmul(seq_enc_per_token[-1].reshape(1,self.d),self.CMM_OUT)
 
-        return computed_sequence_encoding, seq_enc_per_token[-1].reshape(1,self.d), locally_predicted
+        #return computed_sequence_encoding, seq_enc_per_token[-1].reshape(1,self.d), locally_predicted
         #return retrieved_sequence_encoding, seq_enc_per_token[-1].reshape(1,self.d), locally_predicted
-        #return (retrieved_sequence_encoding+computed_sequence_encoding)/2, seq_enc_per_token[-1].reshape(1,self.d), locally_predicted
+        return (retrieved_sequence_encoding+computed_sequence_encoding)/2, seq_enc_per_token[-1].reshape(1,self.d), locally_predicted
 
     def directly_retrieve(self,vector):
         return torch.matmul(vector,self.CMM)

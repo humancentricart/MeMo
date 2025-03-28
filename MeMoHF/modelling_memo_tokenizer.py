@@ -128,6 +128,7 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
         return input_ids, labels
 
 
+
     def get_memo_input(self, batch_input_ids):
         memo_input = {'input_ids': torch.empty((self.head_number, batch_input_ids['input_ids'].shape[0], self.max_length - 1), dtype=torch.int32), 
                       'labels':torch.empty((self.head_number, batch_input_ids['input_ids'].shape[0], self.max_length - 1), dtype=torch.int32)}
@@ -148,15 +149,16 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
             
             memo_input['input_ids'][i] = input_ids[..., :-1]
             memo_input['labels'][i] = input_ids[..., 1:]
-        
+
         return memo_input
+        
     
-    def memo_heads_encode(self, text: Union[str, List[str], List[List[str]]] = None, 
-               padding='max_length', truncation=True, max_length=None):
-        
-        batch_input_ids = self.__call__(text, padding=padding, truncation=truncation, max_length=max_length)
-        memo_input = self.get_memo_input(batch_input_ids)
-        return memo_input
+    #def memo_heads_encode(self, text: Union[str, List[str], List[List[str]]] = None, 
+    #           padding='max_length', truncation=True, max_length=None):
+    #    
+    #    batch_input_ids = self.__call__(text, padding=padding, truncation=truncation, max_length=max_length)
+    #    memo_input = self.get_memo_input(batch_input_ids)
+    #    return memo_input
 
 
     def get_text_batch_encoding(self, text: Union[str, List[str], List[List[str]]] = None, 
@@ -188,7 +190,7 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
         files = self._tokenizer.model.save(f"{save_directory}/encoder/tokenizer", name=filename_prefix)
         return tuple(files)
 
-    # TODO remove
+    #TODO remove
     def input_token_ids(self, text, return_tensors=None): #TODO overwrite the __call__ method instead
         input_ids = self.__call__(text, return_tensors=return_tensors, return_attention_mask=False)['input_ids']
         return input_ids
