@@ -268,10 +268,10 @@ class MeMo(MeMoPreTrainedModel):
         
     
     def memorize_text(self, memo_input):
-        #for i in range(0, self.h):
-        self.memorize(memo_input['input_ids'].to(self.device), 
-                      memo_input['labels'].to(self.device))
-        
+        self.memorize(memo_input['input_ids'].reshape(-1, self.chunk_length).to(self.device), 
+                      memo_input['labels'].reshape(-1, self.chunk_length).to(self.device))
+
+
     
     def forget(self, input_ids, labels_ids, completely=False):
         input_sequence =  self.encoder.encode(input_ids)
@@ -327,14 +327,12 @@ class MeMo(MeMoPreTrainedModel):
             else:
                 break
         
-        
-    
-    def forget_text(self, memo_input, completely=True):
-        #for i in range(0,self.h):
-        self.forget(memo_input['input_ids'].to(self.device),
-                    memo_input['labels'].to(self.device), 
-                    completely=completely)
 
+    def forget_text(self, memo_input, completely=False):
+        self.forget(memo_input['input_ids'].reshape(-1, self.chunk_length).to(self.device),
+                    memo_input['labels'].reshape(-1, self.chunk_length).to(self.device), 
+                    completely=completely)
+    
     
     def retrieve(self,
         input_ids: Optional[torch.Tensor] = None,

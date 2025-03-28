@@ -15,6 +15,7 @@ from transformers import GPTNeoXTokenizerFast
 import transformers
 import json
 import os
+import torch
 
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
@@ -127,30 +128,28 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
         return input_ids, labels
 
 
-    #def get_memo_input(self, batch_input_ids):
-    #    memo_input = {}
-    #    for i in range(self.head_number):
-    #        end = batch_input_ids['input_ids'].shape[-1] - i
-    #        start = max(0, end - self.max_length)
-    #        
-    #        if start > 0 and i == 0:
-    #            print(f"Truncation enabled input = {batch_input_ids['input_ids'].shape} vs {self.max_length}")
 
-    #        input_ids = batch_input_ids['input_ids'][..., start:end]
-    #        #labels = batch_input_ids['input_ids'][..., start+1:end]
-    #        
-    #        if input_ids.shape[-1] != self.max_length:
-    #            input_ids = self.pad({'input_ids':input_ids}, max_length=self.max_length, padding='max_length')
-    #            input_ids = input_ids['input_ids']
-    #        
-    #        memo_input[i] = {'input_ids': input_ids[..., :-1], 
-    #                         'labels': input_ids[..., 1:]}
-    #    
-    #    return memo_input
+    def get_memo_input(self, batch_input_ids):
+        memo_input = {'input_ids': torch.empty((self.head_number, batch_input_ids['input_ids'].shape[0], self.max_length - 1), dtype=torch.int32), 
+                      'labels':torch.empty((self.head_number, batch_input_ids['input_ids'].shape[0], self.max_length - 1), dtype=torch.int32)}
+        
+        for i in range(self.head_number):
+            end = batch_input_ids['input_ids'].shape[-1] - i
+            start = max(0, end - self.max_length)
+            
+            if start > 0 and i == 0:
+                print(f"Truncation enabled input = {batch_input_ids['input_ids'].shape} vs {self.max_length}")
 
-    def get_memo_input(self, input_ids):
-        input_ids = input_ids['input_ids']
-        memo_input = {'input_ids': input_ids[..., :-1], 'labels': input_ids[..., 1:]}
+            input_ids = batch_input_ids['input_ids'][..., start:end]
+            #labels = batch_input_ids['input_ids'][..., start+1:end]
+            
+            if input_ids.shape[-1] != self.max_length:
+                input_ids = self.pad({'input_ids':input_ids}, max_length=self.max_length, padding='max_length')
+                input_ids = input_ids['input_ids']
+            
+            memo_input['input_ids'][i] = input_ids[..., :-1]
+            memo_input['labels'][i] = input_ids[..., 1:]
+
         return memo_input
         
     
