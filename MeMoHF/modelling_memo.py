@@ -383,6 +383,9 @@ class MeMo(MeMoPreTrainedModel):
         sequence_representation = inputs_embeds
 
         (batch_size, current_length, d) = sequence_representation.shape
+        if current_length > self.chunk_length: # truncate the sequence considering only the last [chunk_length] tokens
+            sequence_representation = sequence_representation[:, -self.chunk_length:, :]
+        (batch_size, current_length, d) = sequence_representation.shape
         assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
         
         encoding_for_the_last_layer = torch.zeros((batch_size, self.d)).to(self.device)
