@@ -61,6 +61,9 @@ class ProjectionSequence(Module):
         if init_weights:
             self.reset_parameters()
 
+    def _init_weights(self):
+        self._initialize_weights()
+
     def _initialize_weights(self):
         self.reset_parameters()
         
@@ -112,6 +115,9 @@ class ProjectionTokens(Module):
         if init_weights:
             self.reset_parameters()
 
+    def _init_weights(self):
+        self._initialize_weights()
+
     def _initialize_weights(self):
         self.reset_parameters()
         
@@ -155,6 +161,9 @@ class CorrelationMatrixMemory(Module):
         self.register_parameter("bias", None)
         if init_weights:
             self.reset_parameters()
+    
+    def _init_weights(self):
+        self._initialize_weights()
 
     def _initialize_weights(self):
         self.reset_parameters()
@@ -216,6 +225,9 @@ class MeMoLayer(Module):
             self.CMM = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
             # CMM OUT : correlation matrix memory for the specific layer
             #self.CMM_OUT = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
+
+    def _init_weights(self):
+        self._initialize_weights()
 
     def _initialize_weights(self):
         self.reset_parameters()
