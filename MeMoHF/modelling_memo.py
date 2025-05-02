@@ -15,8 +15,8 @@ from torch.nn.parameter import Parameter
 from transformers.modeling_utils import PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.utils import logging
-# from transformers.generation import GenerationMixin
-from .gen_utils import GenerationMixin
+from transformers.generation import GenerationMixin
+# from .gen_utils import GenerationMixin
 
 
 logger = logging.get_logger(__name__)
@@ -114,12 +114,9 @@ class MeMoCausalLMOutputWithPast(ModelOutput):
 
 
 class MeMoLayers(ModuleList):
-    def _init_weights(self, module):
-        self._initialize_weights(module=module)
-
     def _initialize_weights(self, module):
         pass
-    
+
     def reset_parameters(self):
         pass
 
@@ -145,8 +142,6 @@ class MeMoPreTrainedModel(PreTrainedModel):
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
 
-    def _init_weights(self, module):
-        self._initialize_weights(module=module)
 
     def _initialize_weights(self, module):
         """Initialize the weights. Recursevely called by post_init on each of the child module"""

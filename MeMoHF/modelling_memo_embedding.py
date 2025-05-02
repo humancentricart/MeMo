@@ -189,8 +189,6 @@ class MeMoEmbedding(Embedding):
 
         self.sparse = sparse
 
-    def _init_weights(self):
-        self._initialize_weights()
     
     def _initialize_weights(self):
         self.reset_parameters()
