@@ -33,7 +33,7 @@ class MeMoConfig(PretrainedConfig):
         #classifier_dropout=0.1,
         #layer_norm_epsilon=1e-5,
         #initializer_range=0.02,
-        use_cache=True,
+        use_cache=False,
         bos_token_id=0,
         eos_token_id=0,
         pad_token_id=0,
@@ -54,7 +54,9 @@ class MeMoConfig(PretrainedConfig):
         #self.classifier_dropout = classifier_dropout
         #self.layer_norm_epsilon = layer_norm_epsilon
         #self.initializer_range = initializer_range
-        self.use_cache = use_cache
+
+        # TODO: enable the cache after implementing the cache management
+        self.use_cache = False #use_cache
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id

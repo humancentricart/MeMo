@@ -189,13 +189,15 @@ class MeMoEmbedding(Embedding):
 
         self.sparse = sparse
 
-    def _init_weights(self):
+    def _initialize_weights(self):
         self.reset_parameters()
     
     def reset_parameters(self) -> None:
         ### MeMo initilialization
         print("MeMo embedding initilialization")
         init.normal_(self.weight, mean=self.mean, std=self.std) # TODO add generator?
+        #print(f"SHAPE: {self.weight.shape}")
+        #self.weight.data = self.weight.data.view(-1)[torch.randperm(self.weight.data.numel())].reshape(self.weight.data.shape)
         
         self._fill_padding_idx_with_zero()
 

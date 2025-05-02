@@ -15,13 +15,14 @@ from torch.nn.parameter import Parameter
 from transformers.modeling_utils import PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.utils import logging
-from transformers.generation import GenerationMixin
+# from transformers.generation import GenerationMixin
+from .gen_utils import GenerationMixin
 
 
 logger = logging.get_logger(__name__)
 
 from .modelling_memo_embedding import MeMoEmbedding
-from .modelling_memo_layer import MeMoLayer
+from .modelling_memo_layer import MeMoLayer, CompositionOp
 from .modelling_memo_configuration import MeMoConfig
 from .modelling_memo_exception import MeMoException
 
@@ -29,6 +30,7 @@ import math
 
 VERBOSE = False
 #DEVICE = 'cpu'
+DEBUGGING = False
 
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
@@ -112,7 +114,7 @@ class MeMoCausalLMOutputWithPast(ModelOutput):
 
 
 class MeMoLayers(ModuleList):
-    def _init_weights(self, module):
+    def _initialize_weights(self, module):
         pass
     def reset_parameters(self):
         pass
@@ -139,7 +141,7 @@ class MeMoPreTrainedModel(PreTrainedModel):
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
 
-    def _init_weights(self, module):
+    def _initialize_weights(self, module):
         """Initialize the weights. Recursevely called by post_init on each of the child module"""
         module.reset_parameters() 
     
@@ -159,6 +161,9 @@ class MeMo(MeMoPreTrainedModel):
             num_embeddings=config.vocab_size,
             padding_idx=config.pad_token_id,
             init_weights=False, ## disable the initialization of weights from the constructor (done in the post_init)
+
+            alpha_gen=1,
+            compositionOp=CompositionOp.Prod
         )
         
         self.gradient_checkpointing = False
@@ -167,8 +172,18 @@ class MeMo(MeMoPreTrainedModel):
         self.post_init() 
 
     
-    def _build_model(self, inner_dim, num_of_heads, num_of_layers, chunk_length, 
-                 num_embeddings, padding_idx=0, init_weights=True): #, device=None):
+    def _build_model(self, 
+                inner_dim, 
+                num_of_heads, 
+                num_of_layers, 
+                chunk_length, 
+                num_embeddings, 
+                padding_idx=0, 
+                init_weights=True,
+
+                alpha_gen=1,
+                compositionOp=CompositionOp.Prod
+        ): #, device=None):
         #super().__init__()
         
         self.d = inner_dim
@@ -182,7 +197,12 @@ class MeMo(MeMoPreTrainedModel):
                 " should be divisible for number of heads power numer of layers ("+str(self.max_len) +")")
         
         self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights)
-        self.layers = MeMoLayers([MeMoLayer(self.d, self.h, init_weights=init_weights) for _ in range(num_of_layers)])
+        self.layers = MeMoLayers(
+            [
+                MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, is_last=(i+1==num_of_layers)) 
+                for i in range(num_of_layers)
+            ]
+        )
 
         
     
@@ -228,6 +248,9 @@ class MeMo(MeMoPreTrainedModel):
         #print("input_sequence.shape", input_sequence.shape)
 
         (batch_size, current_length, d) = input_sequence.shape
+        if current_length > self.chunk_length: # truncate the sequence considering only the last [chunk_length] tokens
+            input_sequence = input_sequence[:, -self.chunk_length:, :]
+        (batch_size, current_length, d) = input_sequence.shape
         assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
         
         last_layer = self.layers[self.l-1]
@@ -257,7 +280,10 @@ class MeMo(MeMoPreTrainedModel):
                                for i in range(self.h ** (layer_level + 1), current_length + 1)]
                 input_sequence = input_sequence[:, input_index]
                 
-                
+                if DEBUGGING:
+                    retreived_output_symbol_vector, max_value = self.encoder.decode(output_symbols)
+                    print(retreived_output_symbol_vector)
+
                 ## update the input sequence for the next layer
                 input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].memorize(input_sequence, 
                                                                                                     output_symbols, 
@@ -277,6 +303,9 @@ class MeMo(MeMoPreTrainedModel):
         input_sequence =  self.encoder.encode(input_ids)
         output_symbols = self.encoder.encode(labels_ids)
 
+        (batch_size, current_length, d) = input_sequence.shape
+        if current_length > self.chunk_length: # truncate the sequence considering only the last [chunk_length] tokens
+            input_sequence = input_sequence[:, -self.chunk_length:, :]
         (batch_size, current_length, d) = input_sequence.shape
         assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
         
@@ -317,6 +346,10 @@ class MeMo(MeMoPreTrainedModel):
                 input_index = [[j for j in range(i - self.h ** (layer_level + 1), i, self.h ** ((layer_level + 1) - 1))] 
                                for i in range(self.h ** (layer_level + 1), current_length + 1)]
                 input_sequence = input_sequence[:, input_index]
+
+                if DEBUGGING:
+                    retreived_output_symbol_vector, max_value = self.encoder.decode(output_symbols)
+                    print(retreived_output_symbol_vector)
                 
                 input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].forget(input_sequence, 
                                                                                                   output_symbols, 
@@ -533,6 +566,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         position_ids: Optional[torch.Tensor] = None,
         #head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
         output_hidden_token: Optional[bool] = None, #output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -563,7 +597,10 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         #return retrieved_output_symbol_vector, score_max
     
         lm_logits = self.lm_head.lm_logits(last_token_representation)
-        loss = None
+        loss = None # TODO: compute the loss function
+        if labels is not None:
+            # default loss: transformers.loss.loss_utility.ForCausalLMLoss
+            loss = self.loss_function(logits=lm_logits, labels=labels, vocab_size=self.config.vocab_size)#, **kwargs)
         
         if not return_dict:
             outputs = (lm_logits,) + outputs[1:]
@@ -660,6 +697,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             #head_mask=head_mask,
             inputs_embeds=inputs_embeds,
+            labels=labels,
             use_cache=use_cache,
             output_hidden_token=output_hidden_token,
             output_hidden_states=output_hidden_states,
