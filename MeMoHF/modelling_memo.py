@@ -164,8 +164,8 @@ class MeMo(MeMoPreTrainedModel):
             padding_idx=config.pad_token_id,
             init_weights=False, ## disable the initialization of weights from the constructor (done in the post_init)
 
-            alpha_gen=1,
-            compositionOp=CompositionOp.Prod
+            alpha_gen=config.alpha_gen,
+            compositionOp=CompositionOp.Prod if config.compositionOp=='prod' else CompositionOp.JLT #CompositionOp.Prod
         )
         
         self.gradient_checkpointing = False
