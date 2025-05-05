@@ -37,6 +37,9 @@ class MeMoConfig(PretrainedConfig):
         bos_token_id=0,
         eos_token_id=0,
         pad_token_id=0,
+
+        alpha_gen=1,
+        compositionOp='Prod', #choose between [Prod, JLT], case insensitive
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -63,6 +66,9 @@ class MeMoConfig(PretrainedConfig):
         self.pad_token_id = pad_token_id
         #self.attention_types = attention_types
         #self.attention_layers = self.expand_attention_types_params(attention_types)
+
+        self.alpha_gen = alpha_gen
+        self.compositionOp = compositionOp.lower()
 
         super().__init__(bos_token_id=bos_token_id, 
                          eos_token_id=eos_token_id, 
