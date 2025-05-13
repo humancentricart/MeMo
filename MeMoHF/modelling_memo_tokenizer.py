@@ -16,6 +16,8 @@ import transformers
 import json
 import os
 
+import torch
+
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 
@@ -26,11 +28,11 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
     
     def set_max_length(self, max_length):
         self.max_length = max_length + 1
-        return self
+        #return self
 
     def set_head_number(self, head_number):
         self.head_number = head_number
-        return self
+        #return self
     
     @classmethod
     def from_pretrained(
@@ -57,8 +59,11 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
             token=token,
             revision=revision,
             trust_remote_code=trust_remote_code,
+            # model_max_length=(max_length+1) if max_length is not None else max_length,
             **kwargs
-        ).set_max_length(max_length).set_head_number(head_number)
+        )
+        tokenizer.set_max_length(max_length)
+        tokenizer.set_head_number(head_number)
 
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -183,6 +188,46 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
         memo_input = self.get_memo_input(batch_input_ids)
 
         return memo_input
+    
+
+    def get_text_batch_encoding_for_loss(self, text: Union[str, List[str], List[List[str]]] = None, max_length=None):
+        if max_length is None: max_length = self.max_length
+
+        batch_input_ids = self.__call__(text, padding='longest', truncation='do_not_truncate', max_length=None)
+        longest_length = batch_input_ids['input_ids'].shape[1]
+        batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=max_length)
+
+        # Identify rows that are not all zeros (only padding)
+        non_zero_mask = batch_input_ids['input_ids'].abs().sum(dim=1) != 0
+
+        for k in batch_input_ids:
+            n_text = batch_input_ids[k].shape[0]
+            new_seq = batch_input_ids[k].shape[1] // max_length
+            
+            batch_input_ids[k] = batch_input_ids[k].reshape(n_text * new_seq, self.max_length)
+    
+            # Filter rows using the mask
+            batch_input_ids[k] = batch_input_ids[k][non_zero_mask]
+
+        batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=max_length+longest_length)
+
+        memo_input = self.get_memo_input(batch_input_ids)
+        batch_encoding = memo_input
+
+        # prepare inputs for computing the loss of the full-lenght sentence, which consists into the following steps:
+        # 1. extend inputs' length of [max_length] padding tokens, to obtain a [max_length]+max_batch_length tensor
+        # 2. extend labels' length to match the length of the inputs', with -100 as IDs for the padding tokens we added
+        input_ids, labels = batch_encoding['input_ids'], batch_encoding['labels']
+        pad_masking = (labels == self.pad_token_id).type(torch.int) #torch.ones(labels == tokenizer.pad_token_id, dtype=torch.long, device=self.memo.device)
+        pad_masking[:, -1] = 0 # ensuring that EOS is not considered as padding, even if pad_tok_id == eos_tok_id
+        inverse_pad_masking = (pad_masking == 0).type(torch.int) #torch.ones(pad_masking == 0, dtype=torch.long, device=self.memo.device)
+        labels = pad_masking * -100 + inverse_pad_masking * labels
+
+        return dict(
+            input_ids=input_ids,
+            labels=labels
+        )
+
     
     
     # TODO remove

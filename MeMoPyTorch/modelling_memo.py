@@ -67,7 +67,12 @@ class MeMo(Module):
         for layer_level in range(self.l):
             if self.h ** (layer_level + 1) < current_length + 1:
                 ## update the input sequence for the next layer
-                layer_output_idxs = [i - self.h ** ((layer_level + 1) - 1) for i in range(self.h ** (layer_level + 1), current_length + 1)]
+                layer_output_idxs = [
+                    i - self.h ** ((layer_level + 1) - 1) 
+                    for i in range(
+                        self.h ** (layer_level + 1), current_length + 1
+                    )
+                ]
                 output_symbols = output_symbols[:, layer_output_idxs]
                 #print(output_symbols.shape)
                 

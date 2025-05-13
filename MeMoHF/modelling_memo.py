@@ -274,13 +274,35 @@ class MeMo(MeMoPreTrainedModel):
         for layer_level in range(self.l):
             if self.h ** (layer_level + 1) < current_length + 1:
                 ## update the input sequence for the next layer
-                layer_output_idxs = [i - self.h ** ((layer_level + 1) - 1) for i in range(self.h ** (layer_level + 1), current_length + 1)]
+                layer_output_idxs = [
+                    i - self.h ** ((layer_level + 1) - 1) 
+                    for i in range(
+                        self.h ** (layer_level + 1), 
+                        current_length + 1
+                    )
+                ]
                 output_symbols = output_symbols[:, layer_output_idxs]
                 #print(output_symbols.shape)
+                output_ids = labels_ids[:, layer_output_idxs][0]
+                oids = layer_output_idxs[0]
                 
-                input_index = [[j for j in range(i - self.h ** (layer_level + 1), i, self.h ** ((layer_level + 1) - 1))] 
-                               for i in range(self.h ** (layer_level + 1), current_length + 1)]
+                input_index = [
+                    [
+                        j for j in range(
+                            i - self.h ** (layer_level + 1), 
+                            i, 
+                            self.h ** ((layer_level + 1) - 1)
+                        )   
+                    ] 
+                    for i in range(
+                        self.h ** (layer_level + 1), 
+                        current_length + 1
+                    )
+                ]
                 input_sequence = input_sequence[:, input_index]
+                in_ids = input_ids[:, input_index][0]
+                iids = input_index[0]
+                inseq0 = input_sequence[0]
                 
                 if DEBUGGING:
                     retreived_output_symbol_vector, max_value = self.encoder.decode(output_symbols)
@@ -573,7 +595,8 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         output_hidden_token: Optional[bool] = None, #output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None):
+        cache_position: Optional[torch.LongTensor] = None,
+        compute_loss: Optional[bool] = False):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
@@ -600,9 +623,11 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
     
         lm_logits = self.lm_head.lm_logits(last_token_representation)
         loss = None # TODO: compute the loss function
-        if labels is not None:
-            # default loss: transformers.loss.loss_utility.ForCausalLMLoss
-            loss = self.loss_function(logits=lm_logits, labels=labels, vocab_size=self.config.vocab_size)#, **kwargs)
+        # if labels is not None:
+        #     # default loss: transformers.loss.loss_utility.ForCausalLMLoss
+        #     loss = self.loss_function(logits=lm_logits, labels=labels[:, -1:], vocab_size=self.config.vocab_size)#, **kwargs)
+
+            
         
         if not return_dict:
             outputs = (lm_logits,) + outputs[1:]
@@ -674,11 +699,12 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        compute_loss: Optional[bool] = False
     ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        if labels is not None:
+        if labels is not None and not compute_loss:
             if not self.training:
                 logger.warning_once(
                     "`using forward method with labels but model is in eval mode. Setting model.train() and calling model.memorize"
@@ -705,5 +731,49 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position
+        )
+    
+    def forward_with_loss(
+        self,
+        batch_inputs,
+        return_dict: Optional[bool] = None,
+        # tokenizer = None
+    ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # batch_encoding = tokenizer.get_text_batch_encoding_for_loss(text=text_batch)
+        input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
+
+        logits_list = list()
+        for i in range(self.memo.chunk_length, labels.shape[1]):
+            current_batch = dict(
+                input_ids=input_ids[:, i-self.memo.chunk_length:i],
+                labels=labels[:, i-self.memo.chunk_length:i]
+            )
+            outputs = self.forward(
+                input_ids=current_batch['input_ids'],
+                labels=current_batch['labels'],
+                return_dict=return_dict,
+                compute_loss=True
+            )
+            logits = outputs.logits 
+            logits_list.append(logits)
+        
+        lm_logits = torch.cat(logits_list, dim=1)
+        _labels = labels[:, -lm_logits.shape[1]:]
+        pred = torch.max(lm_logits, dim=-1)
+        loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
+        
+
+        # mask out the final probabilities for padding tokens
+        # TODO: check if -100 labels are ignored in the computation
+
+        return MeMoCausalLMOutputWithPast(
+            loss=loss,
+            logits=lm_logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            hidden_tokens=outputs.hidden_tokens,
         )
 
