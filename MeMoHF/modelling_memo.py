@@ -762,7 +762,6 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         
         lm_logits = torch.cat(logits_list, dim=1)
         _labels = labels[:, -lm_logits.shape[1]:]
-        pred = torch.max(lm_logits, dim=-1)
         loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
         
 
