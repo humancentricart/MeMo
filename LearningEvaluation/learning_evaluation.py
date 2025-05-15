@@ -220,8 +220,7 @@ def experimental_management(params):
                 )
                 train_df = update_df_list(df_list=train_df, update_entry=cfg, csv_path=train_csv)
                 torch.cuda.empty_cache()
-            break
-        break
+
     
     # PPL evaluation (on training data)
     eval_df = pd.read_csv(eval_csv) if os.path.exists(eval_csv) else pd.DataFrame()
