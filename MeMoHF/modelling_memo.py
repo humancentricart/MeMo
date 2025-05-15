@@ -746,7 +746,12 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
 
         logits_list = list()
+        outputs = None 
+        lm_logits = None
         for i in range(self.memo.chunk_length, labels.shape[1]):
+            if outputs is not None:
+                del outputs
+                torch.cuda.empty_cache()
             current_batch = dict(
                 input_ids=input_ids[:, i-self.memo.chunk_length:i],
                 labels=labels[:, i-self.memo.chunk_length:i]
@@ -758,15 +763,18 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                 compute_loss=True
             )
             logits = outputs.logits 
-            logits_list.append(logits)
+            if lm_logits is None:
+                lm_logits = logits
+            else: 
+                lm_logits = torch.cat([lm_logits, logits], dim=1)
+            del logits
+            del current_batch
+            # logits_list.append(logits)
         
-        lm_logits = torch.cat(logits_list, dim=1)
-        _labels = labels[:, -lm_logits.shape[1]:]
+        # lm_logits = torch.cat(logits_list, dim=1)
+        _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
         loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
         
-
-        # mask out the final probabilities for padding tokens
-        # TODO: check if -100 labels are ignored in the computation
 
         return MeMoCausalLMOutputWithPast(
             loss=loss,

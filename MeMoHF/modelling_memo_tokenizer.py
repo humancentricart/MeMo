@@ -30,9 +30,9 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
         self.max_length = max_length + 1
         #return self
 
-    def set_head_number(self, head_number):
-        self.head_number = head_number
-        #return self
+    # def set_head_number(self, head_number):
+    #     self.head_number = head_number
+    #     #return self
     
     @classmethod
     def from_pretrained(
@@ -46,7 +46,8 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
         revision: str = "main",
         trust_remote_code=False,
         max_length: int = None,
-        head_number: int = 4, #New!
+        model_max_length: int = None, 
+        # head_number: int = 4, #New!
         **kwargs,
     ):
         
@@ -59,11 +60,13 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
             token=token,
             revision=revision,
             trust_remote_code=trust_remote_code,
-            # model_max_length=(max_length+1) if max_length is not None else max_length,
+            # model_max_length=(model_max_length+1) if model_max_length is not None else model_max_length,
             **kwargs
         )
-        tokenizer.set_max_length(max_length)
-        tokenizer.set_head_number(head_number)
+        # tokenizer.set_max_length(max_length)
+        # tokenizer.set_head_number(head_number)
+        if model_max_length is not None:
+            tokenizer.model_max_length = model_max_length + 1
 
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -96,7 +99,7 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
         **kwargs) -> BatchEncoding:
         
         if max_length is None and (truncation == True or truncation == 'longest_first'):
-            max_length = self.max_length
+            max_length = self.model_max_length
         
         return super().__call__(
             text=text,
@@ -171,13 +174,13 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
                padding='max_length', truncation=True, max_length=None):
         
         batch_input_ids = self.__call__(text, padding='longest', truncation='do_not_truncate', max_length=None)
-        batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=self.max_length)
+        batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=self.model_max_length)
 
         for k in batch_input_ids:
             n_text = batch_input_ids[k].shape[0]
-            new_seq = batch_input_ids[k].shape[1] // self.max_length
+            new_seq = batch_input_ids[k].shape[1] // self.model_max_length
             
-            batch_input_ids[k] = batch_input_ids[k].reshape(n_text * new_seq, self.max_length)
+            batch_input_ids[k] = batch_input_ids[k].reshape(n_text * new_seq, self.model_max_length)
     
             # Identify rows that are not all zeros (only padding)
             non_zero_mask = batch_input_ids[k].abs().sum(dim=1) != 0
@@ -191,23 +194,27 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
     
 
     def get_text_batch_encoding_for_loss(self, text: Union[str, List[str], List[List[str]]] = None, max_length=None):
-        if max_length is None: max_length = self.max_length
+        if max_length is None: max_length = self.model_max_length
 
         batch_input_ids = self.__call__(text, padding='longest', truncation='do_not_truncate', max_length=None)
         longest_length = batch_input_ids['input_ids'].shape[1]
         batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=max_length)
 
         # Identify rows that are not all zeros (only padding)
-        non_zero_mask = batch_input_ids['input_ids'].abs().sum(dim=1) != 0
+        non_zero_mask = None #batch_input_ids['input_ids'].abs().sum(dim=1) != 0
 
-        for k in batch_input_ids:
+        for k in ['input_ids', 'token_type_ids']:#batch_input_ids:
             n_text = batch_input_ids[k].shape[0]
             new_seq = batch_input_ids[k].shape[1] // max_length
             
-            batch_input_ids[k] = batch_input_ids[k].reshape(n_text * new_seq, self.max_length)
+            batch_input_ids[k] = batch_input_ids[k].reshape(n_text * new_seq, self.model_max_length)
+
+            if k == 'input_ids':
+                non_zero_mask = batch_input_ids['input_ids'].abs().sum(dim=1) != 0
     
             # Filter rows using the mask
-            batch_input_ids[k] = batch_input_ids[k][non_zero_mask]
+            if non_zero_mask is not None:
+                batch_input_ids[k] = batch_input_ids[k][non_zero_mask]
 
         batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=max_length+longest_length)
 
