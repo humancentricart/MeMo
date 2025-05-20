@@ -96,7 +96,7 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
         data_batch = tokenizer.get_text_batch_encoding(batch_examples['text'])
         model.memorize_text(data_batch)
         idx += 1
-        if idx % save_every_k_batches == 0:
+        if save_every_k_batches > 0 and idx % save_every_k_batches == 0:
             batch_model_path = f'{model_path}-batch_id=[{idx}]'
             model.save_pretrained(batch_model_path)
             tokenizer.save_pretrained(batch_model_path)
@@ -111,23 +111,8 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
     del model, tokenizer 
     torch.cuda.empty_cache()
     # return model_name, model, tokenizer
-        
-def evaluate_memo(model_path, eval_datasets):
-    seed_everything(42)
-    model_train_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
-    data_name = model_train_cfg.get('data_name', '')
-    data_paths = [p for p in eval_datasets if data_name == os.path.basename(p)]
-    if len(data_paths) == 0:
-        return None
-    data_path = data_paths[0]
-    data = load_dataset(data_dir=data_path)
-    data_iter = data['train'].iter(batch_size=model_train_cfg['batch_size'])
-    idx = 0
 
-    tokenizer = MeMoTokenizer.from_pretrained(model_path)
-    model = MeMoForCausalLM.from_pretrained(model_path, device_map="auto")
-    device = model.memo.device
-    
+def compute_ppl(model, tokenizer, device, data_iter):
     nll_sum = 0.0
     n_tokens = 0
     for batch_examples in tqdm(data_iter):
@@ -158,15 +143,41 @@ def evaluate_memo(model_path, eval_datasets):
     
     avg_nll = nll_sum / n_tokens  # average negative log-likelihood per token
     ppl = torch.exp(avg_nll)
+    return dict(
+        n_tokens=n_tokens,
+        avg_nll=avg_nll.detach().cpu().item(),
+        ppl=ppl.detach().cpu().item()
+    )
+
+
+def evaluate_memo(model_path, eval_datasets):
+    seed_everything(42)
+    model_train_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
+    data_name = model_train_cfg.get('data_name', '')
+    data_paths = [p for p in eval_datasets if data_name == os.path.basename(p)]
+    if len(data_paths) == 0:
+        return None
+    data_path = data_paths[0]
+    data = load_dataset(data_dir=data_path)
+    data_iter = data['train'].iter(batch_size=model_train_cfg['batch_size'])
+    idx = 0
+
+    tokenizer = MeMoTokenizer.from_pretrained(model_path)
+    model = MeMoForCausalLM.from_pretrained(model_path, device_map="auto")
+    device = model.memo.device
+    
+    model.eval()
+
+    with torch.no_grad():
+        ppl_res = compute_ppl(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            data_iter=data_iter
+        )
 
     results = model_train_cfg
-    results.update(
-        dict(
-            n_tokens=n_tokens,
-            avg_nll=avg_nll.detach().cpu().item(),
-            ppl=ppl.detach().cpu().item()
-        )
-    )
+    results.update(ppl_res)
     del model, tokenizer
     torch.cuda.empty_cache()
     return results
@@ -248,7 +259,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--data_dir', default='LearningEvaluation/training_data/samples')
 parser.add_argument('--models_dir', default='LearningEvaluation/models')
 parser.add_argument('--seeds', default=[42])
-parser.add_argument('--batch_size', default=8)
+parser.add_argument('--batch_size', default=1)
 parser.add_argument('--train_csv', default='memo_trained.csv')
 parser.add_argument('--eval_csv', default='memo_ppl_train_eval.csv')
 # parser.add_argument('--')

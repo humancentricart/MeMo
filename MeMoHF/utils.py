@@ -57,3 +57,22 @@ def load_text_datasets(data_dir, prefix_filter_in=None):
             load_from_disk(dir_)['train'].select_columns(['text']) for dir_ in dirs    
         ])
     )
+
+
+def windowed_sequence(tensor_ids, window_size, hidden_dim=None):
+    x_wins = tensor_ids
+    if len(tensor_ids.shape) > 2:
+        x_wins = x_wins.permute(0,2,1)
+    x_wins = x_wins.unfold(dimension=-1, size=window_size, step=1)
+    if len(tensor_ids.shape) > 2:
+        x_wins = x_wins.permute(0,2,3,1)
+        x_wins = x_wins.contiguous().view(-1, window_size, hidden_dim)
+    else:
+        x_wins = x_wins.contiguous().view(-1, window_size)
+    return x_wins
+
+def restore_windowed_sequence_outputs(output_ids, batch_size, hidden_dim=None):
+    return output_ids.view(batch_size, -1, hidden_dim) if hidden_dim is not None else output_ids.view(batch_size, -1)
+
+
+

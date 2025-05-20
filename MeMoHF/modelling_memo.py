@@ -25,6 +25,7 @@ from .modelling_memo_embedding import MeMoEmbedding
 from .modelling_memo_layer import MeMoLayer, CompositionOp
 from .modelling_memo_configuration import MeMoConfig
 from .modelling_memo_exception import MeMoException
+from .utils import windowed_sequence, restore_windowed_sequence_outputs
 
 import math
 
@@ -539,7 +540,7 @@ class MeMo(MeMoPreTrainedModel):
             hidden_tokens=all_hidden_tokens,
         )
 
-        
+from .loss_utils import ForCausalLMLoss
 
 class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
@@ -548,7 +549,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.memo = MeMo(config)
         self.lm_head = self.memo.encoder # same embedding and un-embedding matrix
-        
+        self.loss_function = ForCausalLMLoss
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -774,7 +775,62 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         # lm_logits = torch.cat(logits_list, dim=1)
         _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
         loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
+        argmax = torch.argmax(lm_logits, dim=-1)
+
+        return MeMoCausalLMOutputWithPast(
+            loss=loss,
+            logits=lm_logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            hidden_tokens=outputs.hidden_tokens,
+        )
+    
+    def forward_with_loss_parallelized(
+        self,
+        batch_inputs,
+        return_dict: Optional[bool] = None,
+        # tokenizer = None
+    ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # batch_encoding = tokenizer.get_text_batch_encoding_for_loss(text=text_batch)
+        input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
+
+        logits_list = list()
+        outputs = None 
+        lm_logits = None
+        # for i in range(self.memo.chunk_length, labels.shape[1]):
         
+        source_ids = windowed_sequence(
+            tensor_ids=input_ids,
+            window_size=self.memo.chunk_length,
+            # hidden_dim=self.memo.config.hi
+        )
+        # target_ids = windowed_sequence(
+        #     tensor_ids=labels[:, -self.memo.chunk_length:],
+        #     window_size=1
+        # )
+
+        outputs = self.forward(
+            input_ids=source_ids,
+            # labels=target_ids,
+            return_dict=return_dict,
+            compute_loss=True
+        )
+
+        logits = outputs.logits 
+        lm_logits = restore_windowed_sequence_outputs(
+            output_ids=logits,
+            batch_size=input_ids.shape[0],
+            hidden_dim=self.config.vocab_size
+        )
+            # logits_list.append(logits)
+        
+        # lm_logits = torch.cat(logits_list, dim=1)
+        _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
+        loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
+        argmax = torch.argmax(lm_logits, dim=-1)
 
         return MeMoCausalLMOutputWithPast(
             loss=loss,
