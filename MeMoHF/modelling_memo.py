@@ -540,7 +540,7 @@ class MeMo(MeMoPreTrainedModel):
             hidden_tokens=all_hidden_tokens,
         )
 
-from .loss_utils import ForCausalLMLoss
+# from .loss_utils import ForCausalLMLoss
 
 class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
@@ -549,7 +549,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.memo = MeMo(config)
         self.lm_head = self.memo.encoder # same embedding and un-embedding matrix
-        self.loss_function = ForCausalLMLoss
+        # self.loss_function = ForCausalLMLoss
         # Initialize weights and apply final processing
         self.post_init()
 
