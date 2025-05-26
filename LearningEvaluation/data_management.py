@@ -65,7 +65,7 @@ def sampling_data(data, ratio=.1, num_samples=None, rand=True, truncate=False):
 
 # prepare and load data (large sample from a dataset)
 def create_large_sample(save_dir, dataset_name, n_sample=3*(10**5)):
-    data_path = '/home/gaxompe/DeepAI/hf_cache/datasets/wikipedia/20200501.en/1.0.0/009f923d9b6dd00c00c8cdc7f408f2b47f45dd4f5fb7982a21f9448f4afbe475/wikipedia-train.arrow'
+    data_path = '~/hf_cache/datasets/wikipedia/20200501.en/1.0.0/009f923d9b6dd00c00c8cdc7f408f2b47f45dd4f5fb7982a21f9448f4afbe475/wikipedia-train.arrow'
     data = Dataset.from_file(data_path).select_columns('text')
     data_sample = sampling_data(
         data=data,

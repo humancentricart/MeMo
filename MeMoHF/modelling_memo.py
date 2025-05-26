@@ -789,7 +789,9 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         self,
         batch_inputs,
         return_dict: Optional[bool] = None,
+        compute_accuracy=False,
         # tokenizer = None
+        # pad_token_id=0
     ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -828,9 +830,32 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             # logits_list.append(logits)
         
         # lm_logits = torch.cat(logits_list, dim=1)
-        _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
+        _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)#labels
+        # _labels[_labels == pad_token_id] = -100 # TODO: manage situations in which EOS is 0; replace 0 with tokenizer.pad_token_id
         loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
-        argmax = torch.argmax(lm_logits, dim=-1)
+        # pred = torch.max(lm_logits, dim=-1)
+        # p_indices, p_values = pred.indices, pred.values
+        accuracy_results = None
+        if compute_accuracy:
+            # argmax for selecting most probable labels
+            pred = torch.max(lm_logits, dim=-1)
+            p_indices, p_values = pred.indices, pred.values
+            # create bitmask for correctly predicted labels
+            correct_tokens = (p_indices == _labels).type(torch.int)
+            # set bitmask entries to 0 for -100 tokens
+            correct_tokens[_labels == -100] = 0
+            correct_tokens = torch.sum(correct_tokens)
+            # count how many tokens != -100 in labels
+            tot_tokens = torch.sum((_labels != -100).type(torch.int))
+            # compute accuracy, and return dictionary with these fields
+            accuracy_results = dict(
+                accuracy=(correct_tokens/tot_tokens).detach().cpu().item(),
+                correct_tokens=correct_tokens.detach().cpu().item(),
+                tot_tokens=tot_tokens.detach().cpu().item()
+            )
+
+
+
 
         return MeMoCausalLMOutputWithPast(
             loss=loss,
@@ -838,5 +863,5 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             hidden_tokens=outputs.hidden_tokens,
-        )
+        ), accuracy_results
 

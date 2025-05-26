@@ -245,6 +245,7 @@ class EvaluationUpdateNew:
         
         #for i in tqdm.tqdm(range(basic_block,  number_of_tokens - 1)):
         #    text_tokens = input_ids[:, i - basic_block:i]
+        pred = None
         for i in tqdm.tqdm(range(starting_point,  number_of_tokens - 1)):
             text_tokens = input_ids[:, max(0,i - 1 - max_length):i]
             
@@ -273,6 +274,7 @@ class EvaluationUpdateNew:
             #correct += torch.sum(out.to('cpu') == input_ids[:, i])
             correct += torch.sum(appo5)
 
+            pred = out if pred is None else torch.cat([pred, out], dim=-1)
             #count += batch_size
             #correct += torch.sum(out.to('cpu') == input_ids[:, i])
         

@@ -115,19 +115,28 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
 def compute_ppl(model, tokenizer, device, data_iter):
     nll_sum = 0.0
     n_tokens = 0
+    accuracy_aggregate = dict(
+        correct_tokens=0,
+        tot_tokens=0
+    )
     for batch_examples in tqdm(data_iter):
         batch_inputs = tokenizer.get_text_batch_encoding_for_loss(text=batch_examples['text'])
         input_ids, target_ids = batch_inputs['input_ids'].to(device), batch_inputs['labels'].to(device)
 
         with torch.no_grad():
-            outputs = model.forward_with_loss(
-                batch_inputs=batch_inputs
+            outputs, accuracy = model.forward_with_loss_parallelized(
+                batch_inputs=batch_inputs,
+                compute_accuracy=True
             )
 
             # loss is calculated using CrossEntropyLoss which averages over valid labels
             # N.B. the model only calculates loss over trg_len - 1 labels, because it internally shifts the labels
             # to the left by 1.
             neg_log_likelihood = outputs.loss
+        
+        for k in accuracy:
+            if k not in accuracy_aggregate: continue
+            accuracy_aggregate[k] += accuracy[k]
         
         # Accumulate the total negative log-likelihood and the total number of tokens
         num_valid_tokens = (target_ids != -100).sum().item()  # number of valid tokens in target_ids
@@ -143,11 +152,14 @@ def compute_ppl(model, tokenizer, device, data_iter):
     
     avg_nll = nll_sum / n_tokens  # average negative log-likelihood per token
     ppl = torch.exp(avg_nll)
-    return dict(
+    res_dict = dict(
         n_tokens=n_tokens,
         avg_nll=avg_nll.detach().cpu().item(),
-        ppl=ppl.detach().cpu().item()
+        ppl=ppl.detach().cpu().item(),
+        accuracy=accuracy_aggregate['correct_tokens']/accuracy_aggregate['tot_tokens']
     )
+    res_dict.update(accuracy_aggregate)
+    return res_dict
 
 
 def evaluate_memo(model_path, eval_datasets):
