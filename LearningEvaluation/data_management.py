@@ -126,6 +126,11 @@ def load_models_list(models_dir):
     dirs.sort()
     return dirs
 
+def load_memorized_data_batches(models_dir):
+    batches = [f.path for f in os.scandir(models_dir) if not f.is_dir() and str(f.path).endswith('.data_batch.json')]
+    batches.sort()
+    return batches
+
 # load sample data for training, with truncation based on MEMO hypeparams
 def load_dataset(data_dir):
     return DatasetDict(train=load_from_disk(data_dir).select_columns(['text']))

@@ -98,8 +98,12 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
         idx += 1
         if save_every_k_batches > 0 and idx % save_every_k_batches == 0:
             batch_model_path = f'{model_path}-batch_id=[{idx}]'
+            # save model
             model.save_pretrained(batch_model_path)
             tokenizer.save_pretrained(batch_model_path)
+            # save last learned example for memorization evaluation
+            with open(f'{batch_model_path}.data_batch.json', 'w') as f:
+                json.dump(batch_examples, f, indent=4)
         del batch_examples
         torch.cuda.empty_cache()
 
@@ -209,12 +213,43 @@ def update_df_list(df_list, update_entry, csv_path=None):
     return new_df
 
 
+def equal_dicts(dict_a, dict_b, ignore_keys):
+    ka = set(dict_a).difference(ignore_keys)
+    kb = set(dict_b).difference(ignore_keys)
+    return ka == kb and all(dict_a[k] == dict_b[k] for k in ka)
+
+
+def evaluate_single_batch_memo(model_path, batch_data):
+    seed_everything(42)
+    model_train_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
+
+    tokenizer = MeMoTokenizer.from_pretrained(model_path)
+    model = MeMoForCausalLM.from_pretrained(model_path, device_map="auto")
+    device = model.memo.device
+    
+    model.eval()
+
+    with torch.no_grad():
+        ppl_res = compute_ppl(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            data_iter=[batch_data]
+        )
+
+    del model, tokenizer
+    torch.cuda.empty_cache()
+    return ppl_res
+
+
+
 def experimental_management(params):
     batch_size = params.batch_size
     data_dir = params.data_dir
     models_dir = params.models_dir
     train_csv = params.train_csv
     eval_csv = params.eval_csv
+    mem_curve_eval_csv = params.mem_curve_eval_csv
     sample_datasets = load_datasets_list(data_dir=data_dir)
 
     train_df = pd.read_csv(train_csv) if os.path.exists(train_csv) else pd.DataFrame()
@@ -247,21 +282,49 @@ def experimental_management(params):
     
     # PPL evaluation (on training data)
     eval_df = pd.read_csv(eval_csv) if os.path.exists(eval_csv) else pd.DataFrame()
+    mem_curve_df = pd.read_csv(mem_curve_eval_csv) if os.path.exists(mem_curve_eval_csv) else pd.DataFrame()
          
     models = load_models_list(models_dir=models_dir)
+    memorized_batches = load_memorized_data_batches(models_dir=models_dir)
+    # model_memorization_curve = list()
     for model_path in models:
         ckpt_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
-        if check_for_configuration(src_df=eval_df, cfg=ckpt_cfg):
-            continue
-        results = evaluate_memo(
-            model_path=model_path,
-            eval_datasets=sample_datasets
-        )
-        if results is None: continue
-        # update the tracking list for evaluation
-        # eval_df = pd.concat([eval_df, pd.DataFrame([results])], ignore_index=True)
-        # eval_df.to_csv(eval_csv)
-        eval_df = update_df_list(df_list=eval_df, update_entry=results, csv_path=eval_csv)
+        if not check_for_configuration(src_df=eval_df, cfg=ckpt_cfg):
+            # continue
+            results = evaluate_memo(
+                model_path=model_path,
+                eval_datasets=sample_datasets
+            )
+            if results is None: continue
+            # update the tracking list for evaluation
+            # eval_df = pd.concat([eval_df, pd.DataFrame([results])], ignore_index=True)
+            # eval_df.to_csv(eval_csv)
+            eval_df = update_df_list(df_list=eval_df, update_entry=results, csv_path=eval_csv)
+
+        for mem_batch_path in memorized_batches:
+            batch_cfg = convert_text_into_cfg(text=os.path.basename(mem_batch_path.replace('.data_batch.json', '')))
+            if not equal_dicts(dict_a=ckpt_cfg, dict_b=batch_cfg, ignore_keys=['batch_id']): continue
+            data_batch_id = batch_cfg['batch_id']
+            ckpt_batch_id = ckpt_cfg['batch_id']
+            # if data_batch_id < ckpt_batch_id: continue # TODO: ignore batches_id not seen by the checkpoints
+            ckpt_cfg['data_batch_id'] = data_batch_id
+            if check_for_configuration(src_df=mem_curve_df, cfg=cfg): continue
+            with open(mem_batch_path) as f:
+                batch_data = json.load(f)
+            results = evaluate_single_batch_memo(
+                model_path=model_path,
+                batch_data=batch_data
+            )
+            ckpt_cfg.update(results)
+            # model_memorization_curve.append(ckpt_cfg)
+            mem_curve_df = update_df_list(
+                df_list=mem_curve_df, 
+                update_entry=ckpt_cfg, 
+                csv_path=mem_curve_eval_csv
+            )
+
+    
+
 
 
 
@@ -274,6 +337,7 @@ parser.add_argument('--seeds', default=[42])
 parser.add_argument('--batch_size', default=1)
 parser.add_argument('--train_csv', default='memo_trained.csv')
 parser.add_argument('--eval_csv', default='memo_ppl_train_eval.csv')
+parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval.csv')
 # parser.add_argument('--')
 
 
