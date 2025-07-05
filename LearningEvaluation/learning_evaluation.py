@@ -233,7 +233,7 @@ def evaluate_single_batch_memo(model_path, batch_data, batch_size=None):
 
     data_iter = list()
     if batch_size is not None: 
-        for i in range(0, len(batch_data['text'], batch_size)):
+        for i in range(0, len(batch_data['text']), batch_size):
             data_iter.append(
                 dict(
                     text=batch_data['text'][i:i+batch_size]
