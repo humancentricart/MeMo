@@ -166,7 +166,9 @@ def compute_ppl(model, tokenizer, device, data_iter):
     return res_dict
 
 
-def evaluate_memo(model_path, eval_datasets):
+def evaluate_memo(model_path, eval_datasets, batch_size=None):
+    if batch_size is None:
+        batch_size = model_train_cfg['batch_size']
     seed_everything(42)
     model_train_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
     data_name = model_train_cfg.get('data_name', '')
@@ -175,7 +177,7 @@ def evaluate_memo(model_path, eval_datasets):
         return None
     data_path = data_paths[0]
     data = load_dataset(data_dir=data_path)
-    data_iter = data['train'].iter(batch_size=model_train_cfg['batch_size'])
+    data_iter = data['train'].iter(batch_size=batch_size)
     idx = 0
 
     tokenizer = MeMoTokenizer.from_pretrained(model_path)
@@ -219,7 +221,7 @@ def equal_dicts(dict_a, dict_b, ignore_keys):
     return ka == kb and all(dict_a[k] == dict_b[k] for k in ka)
 
 
-def evaluate_single_batch_memo(model_path, batch_data):
+def evaluate_single_batch_memo(model_path, batch_data, batch_size=None):
     seed_everything(42)
     model_train_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
 
@@ -229,12 +231,23 @@ def evaluate_single_batch_memo(model_path, batch_data):
     
     model.eval()
 
+    data_iter = list()
+    if batch_size is not None: 
+        for i in range(0, len(batch_data['text'], batch_size)):
+            data_iter.append(
+                dict(
+                    text=batch_data['text'][i:i+batch_size]
+                )
+            )
+    else:
+        data_iter = [batch_data]
+
     with torch.no_grad():
         ppl_res = compute_ppl(
             model=model,
             tokenizer=tokenizer,
             device=device,
-            data_iter=[batch_data]
+            data_iter=data_iter #[batch_data]
         )
 
     del model, tokenizer
@@ -245,6 +258,7 @@ def evaluate_single_batch_memo(model_path, batch_data):
 
 def experimental_management(params):
     batch_size = params.batch_size
+    eval_batch_size = params.eval_batch_size
     data_dir = params.data_dir
     models_dir = params.models_dir
     train_csv = params.train_csv
@@ -293,7 +307,8 @@ def experimental_management(params):
             # continue
             results = evaluate_memo(
                 model_path=model_path,
-                eval_datasets=sample_datasets
+                eval_datasets=sample_datasets,
+                batch_size=eval_batch_size
             )
             if results is None: continue
             # update the tracking list for evaluation
@@ -308,12 +323,14 @@ def experimental_management(params):
             ckpt_batch_id = ckpt_cfg['batch_id']
             # if data_batch_id < ckpt_batch_id: continue # TODO: ignore batches_id not seen by the checkpoints
             ckpt_cfg['data_batch_id'] = data_batch_id
+            ckpt_cfg['eval_batch_size'] = eval_batch_size if eval_batch_size is not None else 'nil'
             if check_for_configuration(src_df=mem_curve_df, cfg=cfg): continue
             with open(mem_batch_path) as f:
                 batch_data = json.load(f)
             results = evaluate_single_batch_memo(
                 model_path=model_path,
-                batch_data=batch_data
+                batch_data=batch_data,
+                batch_size=eval_batch_size
             )
             ckpt_cfg.update(results)
             # model_memorization_curve.append(ckpt_cfg)
@@ -334,7 +351,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--data_dir', default='LearningEvaluation/training_data/samples')
 parser.add_argument('--models_dir', default='LearningEvaluation/models')
 parser.add_argument('--seeds', default=[42])
-parser.add_argument('--batch_size', default=1)
+parser.add_argument('--batch_size', default=16)
+parser.add_argument('--eval_batch_size', default=1)
 parser.add_argument('--train_csv', default='memo_trained.csv')
 parser.add_argument('--eval_csv', default='memo_ppl_train_eval.csv')
 parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval.csv')
