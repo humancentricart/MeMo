@@ -322,9 +322,10 @@ def experimental_management(params):
             data_batch_id = batch_cfg['batch_id']
             ckpt_batch_id = ckpt_cfg['batch_id']
             # if data_batch_id < ckpt_batch_id: continue # TODO: ignore batches_id not seen by the checkpoints
-            ckpt_cfg['data_batch_id'] = data_batch_id
-            ckpt_cfg['eval_batch_size'] = eval_batch_size if eval_batch_size is not None else 'nil'
-            if check_for_configuration(src_df=mem_curve_df, cfg=ckpt_cfg): continue
+            _ckpt_cfg = ckpt_cfg.copy()
+            _ckpt_cfg['data_batch_id'] = data_batch_id
+            _ckpt_cfg['eval_batch_size'] = eval_batch_size if eval_batch_size is not None else 'nil'
+            if check_for_configuration(src_df=mem_curve_df, cfg=_ckpt_cfg): continue
             with open(mem_batch_path) as f:
                 batch_data = json.load(f)
             results = evaluate_single_batch_memo(
@@ -332,11 +333,11 @@ def experimental_management(params):
                 batch_data=batch_data,
                 batch_size=eval_batch_size
             )
-            ckpt_cfg.update(results)
+            _ckpt_cfg.update(results)
             # model_memorization_curve.append(ckpt_cfg)
             mem_curve_df = update_df_list(
                 df_list=mem_curve_df, 
-                update_entry=ckpt_cfg, 
+                update_entry=_ckpt_cfg, 
                 csv_path=mem_curve_eval_csv
             )
 
