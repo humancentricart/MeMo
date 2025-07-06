@@ -324,7 +324,7 @@ def experimental_management(params):
             # if data_batch_id < ckpt_batch_id: continue # TODO: ignore batches_id not seen by the checkpoints
             ckpt_cfg['data_batch_id'] = data_batch_id
             ckpt_cfg['eval_batch_size'] = eval_batch_size if eval_batch_size is not None else 'nil'
-            if check_for_configuration(src_df=mem_curve_df, cfg=cfg): continue
+            if check_for_configuration(src_df=mem_curve_df, cfg=ckpt_cfg): continue
             with open(mem_batch_path) as f:
                 batch_data = json.load(f)
             results = evaluate_single_batch_memo(
