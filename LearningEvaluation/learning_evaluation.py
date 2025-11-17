@@ -24,7 +24,7 @@ from datasets import Dataset, DatasetDict, Features, Value, load_dataset, load_f
 from data_management import *
 
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 
@@ -60,6 +60,10 @@ memo_configs = [
     dict(max_length=1024, d=1024, l=4, h=4)
 ]
 
+def enable_train(model):
+    model.training = True
+    model.train()
+
 def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
     cfg = {**memo_cfg, **train_cfg}
     model_name = convert_cfg_into_text(cfg=cfg)
@@ -86,6 +90,7 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
                pad_token_id=tokenizer.pad_token_id,
               )
     model = MeMoForCausalLM(config).to('cuda')
+    
 
     # data = data.shuffle(seed=42)
     # data = data['train'].to_iterable_dataset(num_shards=128)
@@ -349,10 +354,10 @@ def experimental_management(params):
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data_dir', default='LearningEvaluation/training_data/samples')
-parser.add_argument('--models_dir', default='LearningEvaluation/models')
+parser.add_argument('--data_dir', default='training_data/samples')
+parser.add_argument('--models_dir', default='models')
 parser.add_argument('--seeds', default=[42])
-parser.add_argument('--batch_size', default=16)
+parser.add_argument('--batch_size', default=1)
 parser.add_argument('--eval_batch_size', default=1)
 parser.add_argument('--train_csv', default='memo_trained.csv')
 parser.add_argument('--eval_csv', default='memo_ppl_train_eval.csv')
