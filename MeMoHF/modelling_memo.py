@@ -811,7 +811,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
 
         total_loss = None
 
-        for i in tqdm(range(self.memo.chunk_length, labels.shape[1])):
+        for i in range(self.memo.chunk_length, labels.shape[1]):
             if outputs is not None:
                 del outputs
                 torch.cuda.empty_cache()
