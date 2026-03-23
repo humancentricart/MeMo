@@ -5,6 +5,8 @@ import re
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from tqdm import tqdm
+
 
 import torch
 from torch import Tensor
@@ -734,11 +736,65 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             cache_position=cache_position
         )
     
+    # def forward_with_loss(
+    #     self,
+    #     batch_inputs,
+    #     return_dict: Optional[bool] = None,
+    #     # tokenizer = None
+    #     compute_accuracy=False,
+    # ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
+
+    #     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    #     # batch_encoding = tokenizer.get_text_batch_encoding_for_loss(text=text_batch)
+    #     input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
+
+    #     logits_list = list()
+    #     outputs = None 
+    #     lm_logits = None
+    #     for i in range(self.memo.chunk_length, labels.shape[1]):
+    #         if outputs is not None:
+    #             del outputs
+    #             torch.cuda.empty_cache()
+    #         current_batch = dict(
+    #             input_ids=input_ids[:, i-self.memo.chunk_length:i],
+    #             labels=labels[:, i-self.memo.chunk_length:i]
+    #         )
+    #         outputs = self.forward(
+    #             input_ids=current_batch['input_ids'],
+    #             labels=current_batch['labels'],
+    #             return_dict=return_dict,
+    #             compute_loss=True
+    #         )
+    #         logits = outputs.logits 
+    #         if lm_logits is None:
+    #             lm_logits = logits
+    #         else: 
+    #             lm_logits = torch.cat([lm_logits, logits], dim=1)
+    #         del logits
+    #         del current_batch
+    #         # logits_list.append(logits)
+        
+    #     # lm_logits = torch.cat(logits_list, dim=1)
+    #     _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
+    #     loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
+    #     argmax = torch.argmax(lm_logits, dim=-1)
+
+    #     return MeMoCausalLMOutputWithPast(
+    #         loss=loss,
+    #         logits=lm_logits,
+    #         past_key_values=outputs.past_key_values,
+    #         hidden_states=outputs.hidden_states,
+    #         hidden_tokens=outputs.hidden_tokens,
+    #     )
+
+
     def forward_with_loss(
         self,
         batch_inputs,
         return_dict: Optional[bool] = None,
         # tokenizer = None
+        compute_accuracy=False,
     ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -749,13 +805,20 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         logits_list = list()
         outputs = None 
         lm_logits = None
-        for i in range(self.memo.chunk_length, labels.shape[1]):
+
+        tot_correct_tokens = None 
+        total_tokens = None
+
+        total_loss = None
+
+        for i in tqdm(range(self.memo.chunk_length, labels.shape[1])):
             if outputs is not None:
                 del outputs
                 torch.cuda.empty_cache()
             current_batch = dict(
                 input_ids=input_ids[:, i-self.memo.chunk_length:i],
-                labels=labels[:, i-self.memo.chunk_length:i]
+                # labels=labels[:, i-self.memo.chunk_length:i]
+                labels=labels[:, i-1:i]
             )
             outputs = self.forward(
                 input_ids=current_batch['input_ids'],
@@ -764,26 +827,69 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                 compute_loss=True
             )
             logits = outputs.logits 
-            if lm_logits is None:
-                lm_logits = logits
-            else: 
-                lm_logits = torch.cat([lm_logits, logits], dim=1)
-            del logits
-            del current_batch
+            # if lm_logits is None:
+            #     lm_logits = logits
+            # else: 
+            #     lm_logits = torch.cat([lm_logits, logits], dim=1)
+            # del logits
+            # del current_batch
             # logits_list.append(logits)
+
+            lm_logits = logits
         
-        # lm_logits = torch.cat(logits_list, dim=1)
-        _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
-        loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
-        argmax = torch.argmax(lm_logits, dim=-1)
+            # lm_logits = torch.cat(logits_list, dim=1)
+            # _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
+            # loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
+            # argmax = torch.argmax(lm_logits, dim=-1)
+            _labels = current_batch['labels'].contiguous().to(self.memo.device)
+            loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
+            argmax = torch.argmax(lm_logits, dim=-1)
+
+            if total_loss is None:
+                total_loss = loss
+            else:
+                total_loss += loss
+
+            if compute_accuracy:
+                # argmax for selecting most probable labels
+                pred = torch.max(lm_logits, dim=-1)
+                p_indices, p_values = pred.indices, pred.values
+                
+                # create bitmask for correctly predicted labels
+                correct_tokens = (p_indices == _labels).type(torch.int)
+                
+                # set bitmask entries to 0 for -100 tokens
+                correct_tokens[_labels == -100] = 0
+                correct_tokens = torch.sum(correct_tokens)
+                if tot_correct_tokens is None:
+                    tot_correct_tokens = correct_tokens
+                else:
+                    tot_correct_tokens += correct_tokens
+
+                # count how many tokens != -100 in labels
+                tot_tokens = torch.sum((_labels != -100).type(torch.int))
+                if total_tokens is None:
+                    total_tokens = tot_tokens
+                else:
+                    total_tokens += tot_tokens
+            del current_batch
+            del lm_logits 
+            del logits 
+        # compute accuracy, and return dictionary with these fields
+        accuracy_results = dict(
+            accuracy=(tot_correct_tokens/total_tokens).detach().cpu().item(),
+            correct_tokens=tot_correct_tokens.detach().cpu().item(),
+            tot_tokens=total_tokens.detach().cpu().item()
+        ) if compute_accuracy else None
 
         return MeMoCausalLMOutputWithPast(
-            loss=loss,
-            logits=lm_logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            hidden_tokens=outputs.hidden_tokens,
-        )
+            loss=total_loss,
+            logits=None, #lm_logits,
+            past_key_values=None, #outputs.past_key_values,
+            hidden_states=None, #outputs.hidden_states,
+            hidden_tokens=None, #outputs.hidden_tokens,
+        ), accuracy_results
+    
     
     def forward_with_loss_parallelized(
         self,
