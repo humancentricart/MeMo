@@ -80,6 +80,9 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
                                         padding_side='left', model_max_length=memo_cfg['max_length'], 
                                         # head_number=memo_cfg['h']
                                         )
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.pad_token_id
+    
     config = MeMoConfig(vocab_size=len(tokenizer), #tokenizer.vocab_size, 
                hidden_size=memo_cfg['d'], 
                num_hidden_layers=memo_cfg['l'],
@@ -88,8 +91,11 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
                bos_token_id=tokenizer.bos_token_id,
                eos_token_id=tokenizer.eos_token_id,
                pad_token_id=tokenizer.pad_token_id,
-              )
-    model = MeMoForCausalLM(config).to('cuda')
+    )
+    model = MeMoForCausalLM(config)
+    model.training = True
+    model.train()
+    model.to('cuda')
     
 
     # data = data.shuffle(seed=42)
@@ -187,6 +193,7 @@ def evaluate_memo(model_path, eval_datasets, batch_size=None):
 
     tokenizer = MeMoTokenizer.from_pretrained(model_path)
     model = MeMoForCausalLM.from_pretrained(model_path, device_map="auto")
+    model.to('cuda')
     device = model.memo.device
     
     model.eval()
