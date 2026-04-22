@@ -24,7 +24,7 @@ from datasets import Dataset, DatasetDict, Features, Value, load_dataset, load_f
 from data_management import *
 
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 
@@ -139,7 +139,7 @@ def compute_ppl(model, tokenizer, device, data_iter):
         input_ids, target_ids = batch_inputs['input_ids'].to(device), batch_inputs['labels'].to(device)
 
         with torch.no_grad():
-            outputs, accuracy = model.forward_with_loss_parallelized(
+            outputs, accuracy = model.forward_with_loss(#_parallelized(
                 batch_inputs=batch_inputs,
                 compute_accuracy=True
             )

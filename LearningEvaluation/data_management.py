@@ -132,9 +132,36 @@ def load_memorized_data_batches(models_dir):
     batches.sort()
     return batches
 
+def load_txt_files_and_save(txt_paths, save_dir, dataset_name):
+    """Load one or more plain .txt files into a Dataset and save to disk.
+
+    Args:
+        txt_paths: path string or list of path strings to .txt files.
+        save_dir:  directory where the dataset folder will be created.
+        dataset_name: name of the subfolder passed to save_data_to_disk.
+
+    Returns:
+        The saved Dataset (with a 'text' column, one row per non-empty line).
+    """
+    if isinstance(txt_paths, str):
+        txt_paths = [txt_paths]
+    texts = []
+    for path in txt_paths:
+        with open(path, 'r', encoding='utf-8') as f:
+            lines = [line.rstrip('\n') for line in f if line.strip()]
+        texts.extend(lines)
+    data = Dataset.from_dict({'text': texts})
+    save_data_to_disk(data=data, save_dir=save_dir, base_dir=dataset_name)
+    return data
+
 # load sample data for training, with truncation based on MEMO hypeparams
 def load_dataset(data_dir):
     return DatasetDict(train=load_from_disk(data_dir).select_columns(['text']))
 
 if __name__ == "__main__":
     create_all_datasets(main_data_dir='LearningEvaluation/training_data')
+    # load_txt_files_and_save(
+    #     txt_paths=['../testo_di_prova.txt', '../testo_di_prova0.txt', '../testo_di_prova2.txt', '../testo_di_prova3.txt', '../testo_di_prova4.txt'],
+    #     save_dir='training_data',
+    #     dataset_name='DataProva'
+    # )
