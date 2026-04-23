@@ -240,6 +240,7 @@ def evaluate_single_batch_memo(model_path, batch_data, batch_size=None):
 
     tokenizer = MeMoTokenizer.from_pretrained(model_path)
     model = MeMoForCausalLM.from_pretrained(model_path, device_map="auto")
+    model.to('cuda')
     device = model.memo.device
     
     model.eval()
