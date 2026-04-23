@@ -57,7 +57,8 @@ def convert_text_into_cfg(text):
 # measure MEMO's PPL on full training set for each MEMO version
 
 memo_configs = [
-    dict(max_length=1024, d=1024, l=4, h=4)
+    # dict(max_length=1024, d=1024, l=4, h=4),
+    dict(max_length=4096, d=2048, l=6, h=4)
 ]
 
 def enable_train(model):
@@ -278,6 +279,9 @@ def experimental_management(params):
     mem_curve_eval_csv = params.mem_curve_eval_csv
     sample_datasets = load_datasets_list(data_dir=data_dir)
 
+    if models_dir is not None and not os.path.exists(models_dir):
+        os.makedirs(models_dir)
+
     train_df = pd.read_csv(train_csv) if os.path.exists(train_csv) else pd.DataFrame()
 
     # # training
@@ -287,6 +291,7 @@ def experimental_management(params):
             data_name = os.path.basename(data_sample)
             for memo_cfg in memo_configs:
                 save_every_k_batches=int((len(data['train'])/batch_size)/5)
+                if save_every_k_batches < 1: save_every_k_batches = 1
                 train_cfg = dict(
                     batch_size=batch_size,
                     data_name=data_name,
@@ -361,7 +366,7 @@ def experimental_management(params):
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data_dir', default='training_data/samples')
+parser.add_argument('--data_dir', default='training_data') #samples')
 parser.add_argument('--models_dir', default='models')
 parser.add_argument('--seeds', default=[42])
 parser.add_argument('--batch_size', default=1)
