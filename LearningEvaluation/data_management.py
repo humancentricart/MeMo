@@ -116,6 +116,30 @@ def create_all_datasets(main_data_dir):
             rand=False
         )
 
+# create mini samples from an existing sample folder (e.g. n=001000)
+def create_mini_samples(source_dir, save_dir, num_samples_list, rand=True):
+    """Load a saved dataset and create mini samples of given sizes.
+
+    Args:
+        source_dir:       path to the source dataset folder (e.g. '.../samples/n=001000').
+        save_dir:         directory where the mini-sample folders will be saved.
+        num_samples_list: int or list of ints specifying how many elements to extract.
+        rand:             if True, select elements randomly; otherwise take the first N.
+
+    Returns:
+        dict mapping each requested size to its sampled Dataset.
+    """
+    if isinstance(num_samples_list, int):
+        num_samples_list = [num_samples_list]
+    data = load_from_disk(source_dir).select_columns(['text'])
+    results = {}
+    for num_samples in num_samples_list:
+        sample = sampling_data(data=data, num_samples=num_samples, rand=rand)
+        sample_name = f'n={str(num_samples).zfill(6)}'
+        save_data_to_disk(data=sample, save_dir=save_dir, base_dir=sample_name)
+        results[num_samples] = sample
+    return results
+
 # load list of available datasets (saved)
 def load_datasets_list(data_dir):
     dirs = [f.path for f in os.scandir(data_dir) if f.is_dir()]
@@ -159,9 +183,15 @@ def load_dataset(data_dir):
     return DatasetDict(train=load_from_disk(data_dir).select_columns(['text']))
 
 if __name__ == "__main__":
-    create_all_datasets(main_data_dir='LearningEvaluation/training_data')
+    # create_all_datasets(main_data_dir='LearningEvaluation/training_data')
     # load_txt_files_and_save(
     #     txt_paths=['../testo_di_prova.txt', '../testo_di_prova0.txt', '../testo_di_prova2.txt', '../testo_di_prova3.txt', '../testo_di_prova4.txt'],
     #     save_dir='training_data',
     #     dataset_name='DataProva'
     # )
+    create_mini_samples(
+        source_dir='training_data/samples/n=001000',
+        save_dir='training_data/samples/mini',
+        num_samples_list=[20, 50, 100, 200, 500, 800],
+        rand=False
+    )
