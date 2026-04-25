@@ -58,7 +58,8 @@ def convert_text_into_cfg(text):
 
 memo_configs = [
     # dict(max_length=1024, d=1024, l=4, h=4),
-    dict(max_length=4096, d=2048, l=6, h=4)
+    dict(max_length=4096, d=2048, l=6, h=4, alpha_gen=1, compositionOp='Prod'),
+    dict(max_length=4096, d=2048, l=6, h=4, alpha_gen=1, compositionOp='JLT'),
 ]
 
 def enable_train(model):
@@ -92,6 +93,8 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
                bos_token_id=tokenizer.bos_token_id,
                eos_token_id=tokenizer.eos_token_id,
                pad_token_id=tokenizer.pad_token_id,
+               alpha_gen=memo_cfg['alpha_gen'],
+               compositionOp=memo_cfg['compositionOp'],
     )
     model = MeMoForCausalLM(config)
     model.training = True
