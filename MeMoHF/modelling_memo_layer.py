@@ -199,7 +199,7 @@ class CompositionOp(Enum):
 
 class MeMoLayer(Module):
     
-    def __init__(self, inner_dim, num_of_heads, init_weights=True, is_last=False, alpha=1, compositionOp=CompositionOp.JLT, **kwargs):
+    def __init__(self, inner_dim, num_of_heads, init_weights=True, is_last=False, alpha=1, compositionOp=CompositionOp.JLT, layerized_CMM_OUT = True, **kwargs):
         super().__init__()
         
         self.alpha = alpha # computed vs. memorized sequence decoding (alpha = 1 only computed)
@@ -213,12 +213,15 @@ class MeMoLayer(Module):
         self.use_local_CMM = (alpha < 1)
         self.compOp = compositionOp
 
+        self.layerized_CMM_OUT = layerized_CMM_OUT ### FMZ 2026:05:04
+
         self.Prj = ProjectionSequence(self.d, self.d*self.h, init_weights=init_weights)
         # CMM : correlation matrix memory for the specific layer
         if self.use_local_CMM or is_last:
             self.CMM = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
-            # CMM OUT : correlation matrix memory for the specific layer
-            #self.CMM_OUT = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
+
+        # CMM OUT : correlation matrix memory for the specific layer
+        if self.layerized_CMM_OUT: self.CMM_OUT = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights) ### FMZ 2026:05:04
 
 
     def _initialize_weights(self):
@@ -349,7 +352,7 @@ class MeMoLayer(Module):
             
         seq_enc_plus_out = torch.matmul(torch.transpose(seq_enc_per_token,-2,-1), output_symbols) 
         ## Key (sequenze di h token) x Value ==> matrice??
-        #self.CMM_OUT.memorize(seq_enc_plus_out)
+        if self.layerized_CMM_OUT: self.CMM_OUT.memorize(seq_enc_plus_out)  ### FMZ 2026:05:04
         
         return sequence_encoding, seq_enc_plus_out
     
@@ -394,6 +397,13 @@ class MeMoLayer(Module):
         if self.use_local_CMM:
             retrieved_sequence_encoding = self.CMM(seq_enc_per_token)
 
+
+        if self.layerized_CMM_OUT: 
+            layered_out_token = F.normalize(self.CMM_OUT(seq_enc_per_token[:,-1,:]),p=2,dim=1)
+            #print(f"Adding {layered_out_token.shape()}")
+        else:
+            layered_out_token = None
+            
         #TODO check and rewrite
         #if verbose:
         #    sequence_encoding = self.Prj(input_sequence.reshape((batch_size, blocks, self.d * self.h)))
@@ -411,12 +421,14 @@ class MeMoLayer(Module):
             return dict(
                 sequence_encoding=self.alpha*sequence_encoding+(1-self.alpha)*retrieved_sequence_encoding, 
                 token_encoding=seq_enc_per_token[:, -1].reshape(batch_size,self.d),#, locally_predicted
+                layered_out_token = layered_out_token,
                 cache=None
             )
         else:
             return dict(
                 sequence_encoding=sequence_encoding, 
                 token_encoding=seq_enc_per_token[:, -1].reshape(batch_size,self.d),#, locally_predicted
+                layered_out_token = layered_out_token,
                 cache=None 
             )
 

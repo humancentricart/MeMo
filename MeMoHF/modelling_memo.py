@@ -187,6 +187,7 @@ class MeMo(MeMoPreTrainedModel):
                 init_weights=True,
 
                 alpha_gen=1,
+                layerized_CMM_OUT = True,
                 compositionOp=CompositionOp.Prod
         ): #, device=None):
         #super().__init__()
@@ -196,6 +197,7 @@ class MeMo(MeMoPreTrainedModel):
         self.l = num_of_layers
         self.max_len = self.h**self.l
         self.chunk_length = chunk_length
+        self.layerized_CMM_OUT = layerized_CMM_OUT
         
         if self.chunk_length/self.max_len != self.chunk_length//self.max_len:
             raise MeMoException("Chunk length "+ str(self.chunk_length) + \
@@ -204,7 +206,7 @@ class MeMo(MeMoPreTrainedModel):
         self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights)
         self.layers = MeMoLayers(
             [
-                MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, is_last=(i+1==num_of_layers)) 
+                MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
                 for i in range(num_of_layers)
             ]
         )
@@ -450,7 +452,12 @@ class MeMo(MeMoPreTrainedModel):
         
         encoding_for_the_last_layer = torch.zeros((batch_size, self.d)).to(self.device)
         current_length = self.chunk_length #min(self.chunk_length, self.max_len)
+        
+        
+        if self.layerized_CMM_OUT: 
+            residual_stream = torch.zeros((batch_size, self.d)).to(self.device)
 
+        
         # moved outside the logic for tokenization, here only assertiion above
         #if len(input_sequence) > current_length:
         #    input_sequence = input_sequence[len(input_sequence)-current_length:len(input_sequence)]
@@ -514,6 +521,11 @@ class MeMo(MeMoPreTrainedModel):
             
             sequence_representation, seq_encoding_for_the_last_layer = outputs['sequence_encoding'], outputs['token_encoding']
             encoding_for_the_last_layer += seq_encoding_for_the_last_layer
+            
+            # This is to capture the layer by layer extraction of the next token: the output of each layer is normalized in order to 
+            # penalize short sequences 
+            if self.layerized_CMM_OUT: 
+                residual_stream += outputs['layered_out_token']
 
 
         # Add last hidden state
@@ -523,7 +535,10 @@ class MeMo(MeMoPreTrainedModel):
         next_cache = next_decoder_cache if use_cache else None
 
         last_layer = self.layers[self.l-1]
-        last_token_representation = last_layer.directly_retrieve(encoding_for_the_last_layer)
+        if self.layerized_CMM_OUT: 
+            last_token_representation = residual_stream
+        else:
+            last_token_representation = last_layer.directly_retrieve(encoding_for_the_last_layer)
         
         ## the old decode step should be in the ForCausalLM pass only (and here one perform the retri)
         #retreived_output_symbol_vector, score_max = self.encoder.decode(last_token_representation)
