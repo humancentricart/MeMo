@@ -826,6 +826,17 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
 
         total_loss = None
 
+        # Per-token statistics: {token_id: {'target_count': int, 'correct_count': int}}
+        token_stats = {}
+        
+        # Track padding tokens for masking analysis
+        pad_token_id = getattr(self.config, 'pad_token_id', 0)
+        padding_token_analysis = {
+            'padding_tokens_masked': 0,      # Padding tokens with label == -100
+            'padding_tokens_not_masked': 0,  # Padding tokens with label != -100
+            'padding_tokens_correct': 0      # Padding tokens that were correctly predicted (if not masked)
+        }
+
         for i in range(self.memo.chunk_length, labels.shape[1]):
             if outputs is not None:
                 del outputs
@@ -873,6 +884,49 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                 # create bitmask for correctly predicted labels
                 correct_tokens = (p_indices == _labels).type(torch.int)
                 
+                # Analyze per-token statistics (before masking -100 tokens)
+                valid_mask = _labels != -100  # Tokens that are not masked
+                
+                # Flatten tensors for per-token analysis
+                flat_labels = _labels.flatten()
+                flat_correct = correct_tokens.flatten()
+                flat_valid = valid_mask.flatten()
+                
+                for token_id in torch.unique(flat_labels):
+                    token_id = token_id.item()
+                    if token_id == -100:
+                        continue
+                    
+                    # Find all occurrences of this token
+                    token_mask = (flat_labels == token_id)
+                    
+                    if token_id not in token_stats:
+                        token_stats[token_id] = {'target_count': 0, 'correct_count': 0}
+                    
+                    # Count how many times this token appears as target
+                    token_count = torch.sum(token_mask).item()
+                    token_stats[token_id]['target_count'] += token_count
+                    
+                    # Count how many times it was correctly predicted
+                    correct_for_token = torch.sum(flat_correct[token_mask]).item()
+                    token_stats[token_id]['correct_count'] += correct_for_token
+                
+                # Analyze padding tokens
+                if pad_token_id is not None:
+                    padding_mask = (flat_labels == pad_token_id)
+                    masked_padding = torch.sum((flat_labels == pad_token_id) & (_labels.flatten() == -100)).item()
+                    not_masked_padding = torch.sum((flat_labels == pad_token_id) & (_labels.flatten() != -100)).item()
+                    
+                    padding_token_analysis['padding_tokens_masked'] += masked_padding
+                    padding_token_analysis['padding_tokens_not_masked'] += not_masked_padding
+                    
+                    # Check if any unmasked padding tokens were correctly predicted
+                    if not_masked_padding > 0:
+                        unmasked_padding_correct = torch.sum(
+                            flat_correct[padding_mask & flat_valid]
+                        ).item()
+                        padding_token_analysis['padding_tokens_correct'] += unmasked_padding_correct
+                
                 # set bitmask entries to 0 for -100 tokens
                 correct_tokens[_labels == -100] = 0
                 correct_tokens = torch.sum(correct_tokens)
@@ -890,11 +944,28 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             del current_batch
             del lm_logits 
             del logits 
+
+        # # convert token_stats to list of dicts
+        # token_stats = [
+        #     {
+        #         'token_id': token_id,
+        #         'target_count': stats['target_count'],
+        #         'correct_count': stats['correct_count'],
+        #         #'accuracy': (stats['correct_count'] / stats['target_count']) if stats['target_count'] > 0 else 0.0
+        #     }
+        #     for token_id, stats in token_stats.items()
+        # ]
+        # # create two list of dictionaries from token_stats, one sorted by correct_count and one sorted by accuracy, and keep the top max_token_distrib_rank tokens for each list
+        # token_stats_by_correct = sorted(token_stats, key=lambda x: x['correct_count'], reverse=True)[:max_token_distrib_rank]
+        # token_stats_by_target = sorted(token_stats, key=lambda x: x['correct_count']/x['target_count'], reverse=True)[:max_token_distrib_rank]
+        
         # compute accuracy, and return dictionary with these fields
         accuracy_results = dict(
             accuracy=(tot_correct_tokens/total_tokens).detach().cpu().item(),
             correct_tokens=tot_correct_tokens.detach().cpu().item(),
-            tot_tokens=total_tokens.detach().cpu().item()
+            tot_tokens=total_tokens.detach().cpu().item(),
+            token_stats=token_stats,
+            padding_analysis=padding_token_analysis['padding_tokens_correct'],
         ) if compute_accuracy else None
 
         return MeMoCausalLMOutputWithPast(
