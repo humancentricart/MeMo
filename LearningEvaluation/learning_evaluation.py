@@ -132,93 +132,123 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
     # return model_name, model, tokenizer
 
 def compute_ppl(model, tokenizer, device, data_iter, max_token_distrib_rank=10):
-    nll_sum = 0.0
-    n_tokens = 0
+    """
+    Compute perplexity and accuracy metrics on evaluation data.
+    
+    The model's forward_with_loss already computes perplexity internally with correct
+    loss accumulation. This function aggregates results across batches.
+    
+    Args:
+        model: MeMoForCausalLM model in evaluation mode
+        tokenizer: Tokenizer for token string conversion
+        device: Device to compute on
+        data_iter: Iterator over batches of examples
+        max_token_distrib_rank: Number of top tokens to track per metric
+        
+    Returns:
+        Dictionary with perplexity, NLL, accuracy, and token statistics
+    """
+    total_perplexity_weighted = 0.0  # Weighted sum of perplexities by num_tokens
+    total_tokens = 0  # Aggregate token count
+    total_nll_sum = 0.0  # Sum of all NLLs across batches
+    
     accuracy_aggregate = dict(
         correct_tokens=0,
         tot_tokens=0,
         padding_analysis=0
     )
     token_stats_aggregate = dict()
+    
     for batch_examples in tqdm(data_iter):
         batch_inputs = tokenizer.get_text_batch_encoding_for_loss(text=batch_examples['text'])
-        input_ids, target_ids = batch_inputs['input_ids'].to(device), batch_inputs['labels'].to(device)
 
         with torch.no_grad():
-            outputs, accuracy = model.forward_with_loss(#_parallelized(
+            outputs, accuracy = model.forward_with_loss(
                 batch_inputs=batch_inputs,
                 compute_accuracy=True
             )
 
-            # loss is calculated using CrossEntropyLoss which averages over valid labels
-            # N.B. the model only calculates loss over trg_len - 1 labels, because it internally shifts the labels
-            # to the left by 1.
-            neg_log_likelihood = outputs.loss
+            # The forward_with_loss function now returns perplexity and avg_nll in accuracy dict
+            batch_perplexity = accuracy.get('perplexity', 0.0)
+            batch_avg_nll = accuracy.get('avg_nll', 0.0)
+            batch_num_tokens = accuracy.get('num_tokens', 0)
         
         for k in accuracy:
-            if k not in accuracy_aggregate: continue
+            if k not in accuracy_aggregate: 
+                continue
             accuracy_aggregate[k] += accuracy[k]
         
-        for k in accuracy['token_stats']:
-            if k not in token_stats_aggregate:
-                token_stats_aggregate[k] = dict(
-                    target_count=accuracy['token_stats'][k]['target_count'],
-                    correct_count=accuracy['token_stats'][k]['correct_count'],
-                )
-            else:
-                token_stats_aggregate[k]['correct_count'] += accuracy['token_stats'][k]['correct_count']
-                token_stats_aggregate[k]['target_count'] += accuracy['token_stats'][k]['target_count']
+        # Aggregate token statistics
+        if 'token_stats' in accuracy:
+            for token_id in accuracy['token_stats']:
+                if token_id not in token_stats_aggregate:
+                    token_stats_aggregate[token_id] = dict(
+                        target_count=accuracy['token_stats'][token_id]['target_count'],
+                        correct_count=accuracy['token_stats'][token_id]['correct_count'],
+                    )
+                else:
+                    token_stats_aggregate[token_id]['correct_count'] += accuracy['token_stats'][token_id]['correct_count']
+                    token_stats_aggregate[token_id]['target_count'] += accuracy['token_stats'][token_id]['target_count']
         
-        # Accumulate the total negative log-likelihood and the total number of tokens
-        num_valid_tokens = (target_ids != -100).sum().item()  # number of valid tokens in target_ids
-        batch_size = target_ids.size(0)
-        num_loss_tokens = num_valid_tokens - batch_size  # subtract batch_size due to internal label shift
-        nll_sum += neg_log_likelihood * num_loss_tokens
-        n_tokens += num_loss_tokens
-        del batch_inputs, input_ids, target_ids, outputs, num_valid_tokens, num_loss_tokens, neg_log_likelihood
+        # Accumulate NLL sum and tokens for final perplexity computation
+        if batch_num_tokens > 0:
+            # NLL sum for this batch = batch_avg_nll * batch_num_tokens
+            batch_nll_sum = batch_avg_nll * batch_num_tokens
+            total_nll_sum += batch_nll_sum
+            total_tokens += batch_num_tokens
+        
+        del batch_inputs, outputs, accuracy
         torch.cuda.empty_cache()
-        # idx += 1
-        # if idx > 0:
-        #     break
     
-    # convert token_stats_aggregate into list of dicts, and convert each token id into the corresponding token string using the hf tokenizer
+    # Convert token_stats_aggregate into list of dicts with token strings
     token_stats_list = list()
-    for token in token_stats_aggregate:
+    for token_id in token_stats_aggregate:
+        try:
+            token_str = tokenizer.convert_ids_to_tokens(int(token_id))
+        except:
+            token_str = f"<token_{token_id}>"
+        
         token_stats_list.append(
             dict(
-                token=tokenizer.convert_ids_to_tokens(int(token)),
-                correct_count=token_stats_aggregate[token]['correct_count'],
-                target_count=token_stats_aggregate[token]['target_count'],
-                accuracy=token_stats_aggregate[token]['correct_count']/token_stats_aggregate[token]['target_count']
+                token=token_str,
+                correct_count=token_stats_aggregate[token_id]['correct_count'],
+                target_count=token_stats_aggregate[token_id]['target_count'],
+                accuracy=token_stats_aggregate[token_id]['correct_count']/token_stats_aggregate[token_id]['target_count']
             )
         )
     
-    # create two list of dictionaries from token_stats, one sorted by correct_count and one sorted by accuracy, and keep the top max_token_distrib_rank tokens for each list
-    token_stats_list.sort(key=lambda x: x['correct_count'], reverse=True)
-    token_stats_by_correct_count = token_stats_list[:max_token_distrib_rank]
-    token_stats_list.sort(key=lambda x: x['accuracy'], reverse=True)
-    token_stats_by_accuracy = token_stats_list[:max_token_distrib_rank]
+    # Create rankings by different metrics
+    token_stats_by_correct = sorted(token_stats_list, key=lambda x: x['correct_count'], reverse=True)[:max_token_distrib_rank]
+    token_stats_by_accuracy = sorted(token_stats_list, key=lambda x: x['accuracy'], reverse=True)[:max_token_distrib_rank]
 
-    # convert each ranking into a list of strings of the format "rank. token (correct_count/target_count, accuracy%)"
-    for i in range(len(token_stats_by_correct_count)):
-        token_stats_by_correct_count[i] = f"{i+1}. [{token_stats_by_correct_count[i]['token']}] ({token_stats_by_correct_count[i]['correct_count']}/{token_stats_by_correct_count[i]['target_count']}, {token_stats_by_correct_count[i]['accuracy']*100:.2f}%)"
-    for i in range(len(token_stats_by_accuracy)):
-        token_stats_by_accuracy[i] = f"{i+1}. [{token_stats_by_accuracy[i]['token']}] ({token_stats_by_accuracy[i]['correct_count']}/{token_stats_by_accuracy[i]['target_count']}, {token_stats_by_accuracy[i]['accuracy']*100:.2f}%)"
+    # Format as strings
+    token_stats_by_correct_count = '\n'.join([
+        f"{i+1}. [{s['token']}] ({s['correct_count']}/{s['target_count']}, {s['accuracy']*100:.2f}%)"
+        for i, s in enumerate(token_stats_by_correct)
+    ])
+    token_stats_by_accuracy_str = '\n'.join([
+        f"{i+1}. [{s['token']}] ({s['correct_count']}/{s['target_count']}, {s['accuracy']*100:.2f}%)"
+        for i, s in enumerate(token_stats_by_accuracy)
+    ])
+
+    # Compute final metrics
+    if total_tokens > 0:
+        avg_nll = total_nll_sum / total_tokens
+        ppl = np.exp(avg_nll)
+    else:
+        avg_nll = 0.0
+        ppl = 0.0
     
-    # convert each ranking into a single string with line breaks between each token
-    token_stats_by_correct_count = '\n'.join(token_stats_by_correct_count)
-    token_stats_by_accuracy = '\n'.join(token_stats_by_accuracy)
-
-    avg_nll = nll_sum / n_tokens  # average negative log-likelihood per token
-    ppl = torch.exp(avg_nll)
+    accuracy_value = (accuracy_aggregate['correct_tokens'] / accuracy_aggregate['tot_tokens']) if accuracy_aggregate['tot_tokens'] > 0 else 0.0
+    
     res_dict = dict(
-        n_tokens=n_tokens,
-        avg_nll=avg_nll.detach().cpu().item(),
-        ppl=ppl.detach().cpu().item(),
-        accuracy=accuracy_aggregate['correct_tokens']/accuracy_aggregate['tot_tokens'],
+        n_tokens=total_tokens,
+        avg_nll=avg_nll,
+        ppl=ppl,
+        accuracy=accuracy_value,
         padding_analysis=accuracy_aggregate['padding_analysis'],
         token_stats_by_correct_count=token_stats_by_correct_count,
-        token_stats_by_accuracy=token_stats_by_accuracy
+        token_stats_by_accuracy=token_stats_by_accuracy_str
     )
     res_dict.update(accuracy_aggregate)
     return res_dict
@@ -298,7 +328,7 @@ def evaluate_single_batch_memo(model_path, batch_data, batch_size=None):
                 dict(
                     text=batch_data['text'][i:i+batch_size]
                 )
-            )LearningEvaluation/training_data/samples/mini/n=000020
+            )#LearningEvaluation/training_data/samples/mini/n=000020
     with torch.no_grad():
         ppl_res = compute_ppl(
             model=model,

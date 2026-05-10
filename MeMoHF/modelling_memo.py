@@ -825,6 +825,8 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         total_tokens = None
 
         total_loss = None
+        total_nll_sum = 0.0  # Sum of negative log likelihoods (for perplexity)
+        num_tokens_predicted = 0  # Total number of tokens predicted
 
         # Per-token statistics: {token_id: {'target_count': int, 'correct_count': int}}
         token_stats = {}
@@ -871,10 +873,20 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
             argmax = torch.argmax(lm_logits, dim=-1)
 
+            batch_size = _labels.shape[0]
+            num_valid_tokens_in_batch = (_labels != -100).sum().item()
+            
+            # Accumulate loss: assuming loss_function returns mean loss across valid tokens
+            # Convert mean to sum by multiplying by number of valid tokens
             if total_loss is None:
-                total_loss = loss
+                total_loss = loss * num_valid_tokens_in_batch
             else:
-                total_loss += loss
+                total_loss += loss * num_valid_tokens_in_batch
+            
+            # Accumulate for perplexity: loss is already mean NLL per token
+            # Multiply by number of valid tokens to get sum of NLL for this batch
+            total_nll_sum += loss.detach() * num_valid_tokens_in_batch
+            num_tokens_predicted += num_valid_tokens_in_batch
 
             if compute_accuracy:
                 # argmax for selecting most probable labels
@@ -967,6 +979,26 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             token_stats=token_stats,
             padding_analysis=padding_token_analysis['padding_tokens_correct'],
         ) if compute_accuracy else None
+        
+        # Compute perplexity: exp(average NLL)
+        # average NLL = total_nll_sum / num_tokens_predicted
+        if num_tokens_predicted > 0:
+            avg_nll = total_nll_sum / num_tokens_predicted
+            perplexity_value = torch.exp(avg_nll).detach().cpu().item()
+        else:
+            perplexity_value = 0.0
+        
+        # Add perplexity to the results
+        if accuracy_results is not None:
+            accuracy_results['perplexity'] = perplexity_value
+            accuracy_results['avg_nll'] = (total_nll_sum / num_tokens_predicted).detach().cpu().item() if num_tokens_predicted > 0 else 0.0
+            accuracy_results['num_tokens'] = num_tokens_predicted
+        else:
+            accuracy_results = dict(
+                perplexity=perplexity_value,
+                avg_nll=(total_nll_sum / num_tokens_predicted).detach().cpu().item() if num_tokens_predicted > 0 else 0.0,
+                num_tokens=num_tokens_predicted
+            )
 
         return MeMoCausalLMOutputWithPast(
             loss=total_loss,
