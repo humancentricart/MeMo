@@ -27,7 +27,11 @@ from .modelling_memo_embedding import MeMoEmbedding
 from .modelling_memo_layer import MeMoLayer, CompositionOp
 from .modelling_memo_configuration import MeMoConfig
 from .modelling_memo_exception import MeMoException
-from .utils import windowed_sequence, restore_windowed_sequence_outputs
+from .utils import (
+    windowed_sequence, 
+    restore_windowed_sequence_outputs,
+    MemoForCausalLMLoss
+)
 
 import math
 
@@ -569,6 +573,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         # self.loss_function = ForCausalLMLoss
         # Initialize weights and apply final processing
         self.post_init()
+        self.loss_function = MemoForCausalLMLoss 
 
         
 
@@ -810,6 +815,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         # tokenizer = None
         compute_accuracy=False,
+        # starting_point=4
     ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -839,7 +845,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             'padding_tokens_correct': 0      # Padding tokens that were correctly predicted (if not masked)
         }
 
-        for i in range(self.memo.chunk_length, labels.shape[1]):
+        for i in range(self.memo.chunk_length+1, labels.shape[1]):
             if outputs is not None:
                 del outputs
                 torch.cuda.empty_cache()
@@ -870,7 +876,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             # loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
             # argmax = torch.argmax(lm_logits, dim=-1)
             _labels = current_batch['labels'].contiguous().to(self.memo.device)
-            loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
+            loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size)#, shift_labels=_labels)
             argmax = torch.argmax(lm_logits, dim=-1)
 
             batch_size = _labels.shape[0]
