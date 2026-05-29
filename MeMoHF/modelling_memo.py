@@ -869,7 +869,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             # del current_batch
             # logits_list.append(logits)
 
-            lm_logits = logits
+            lm_logits = logits * 1000 # scale up logits to make them more confident when applying the softmax
         
             # lm_logits = torch.cat(logits_list, dim=1)
             # _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
@@ -877,7 +877,14 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             # argmax = torch.argmax(lm_logits, dim=-1)
             _labels = current_batch['labels'].contiguous().to(self.memo.device)
             loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size)#, shift_labels=_labels)
-            argmax = torch.argmax(lm_logits, dim=-1)
+            
+            ## For debugging and analysis: compute argmax and softmax values for the current batch
+            # argmax = torch.argmax(lm_logits, dim=-1)
+            # argmax_value = torch.max(lm_logits, dim=-1)
+            # _lm_logits_softmax = torch.nn.functional.softmax(lm_logits, dim=-1)
+            # argmax_soft = torch.argmax(_lm_logits_softmax, dim=-1)
+            # argmax_value_soft = torch.max(_lm_logits_softmax, dim=-1)
+
 
             batch_size = _labels.shape[0]
             num_valid_tokens_in_batch = (_labels != -100).sum().item()
