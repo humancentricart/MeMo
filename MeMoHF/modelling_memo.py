@@ -869,7 +869,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             # del current_batch
             # logits_list.append(logits)
 
-            lm_logits = logits * 1000 # scale up logits to make them more confident when applying the softmax
+            lm_logits = (logits + 10) * 1000 # scale up logits to make them more confident when applying the softmax
         
             # lm_logits = torch.cat(logits_list, dim=1)
             # _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
