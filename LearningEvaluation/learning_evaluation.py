@@ -257,6 +257,7 @@ def compute_ppl(model, tokenizer, device, data_iter, max_token_distrib_rank=10):
 def evaluate_memo(model_path, eval_datasets, batch_size=None):
     if batch_size is None:
         batch_size = model_train_cfg['batch_size']
+    batch_size = 1 # forced restriction due to issues with batch evaluation
     seed_everything(42)
     model_train_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
     data_name = model_train_cfg.get('data_name', '')
@@ -311,6 +312,7 @@ def equal_dicts(dict_a, dict_b, ignore_keys):
 
 
 def evaluate_single_batch_memo(model_path, batch_data, batch_size=None):
+    batch_size = 1 # forced restriction due to issues with batch evaluation 
     seed_everything(42)
     model_train_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
 

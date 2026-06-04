@@ -815,9 +815,10 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         # tokenizer = None
         compute_accuracy=False,
-        # starting_point=4
+        starting_point=2
     ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
 
+        starting_point = max(2, starting_point) 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # batch_encoding = tokenizer.get_text_batch_encoding_for_loss(text=text_batch)
@@ -845,7 +846,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             'padding_tokens_correct': 0      # Padding tokens that were correctly predicted (if not masked)
         }
 
-        for i in range(self.memo.chunk_length+1, labels.shape[1]):
+        for i in range(self.memo.chunk_length+starting_point, labels.shape[1]):
             if outputs is not None:
                 del outputs
                 torch.cuda.empty_cache()
@@ -869,7 +870,8 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             # del current_batch
             # logits_list.append(logits)
 
-            lm_logits = (logits + 10) * 1000 # scale up logits to make them more confident when applying the softmax
+            # lm_logits = (logits + 10) * 1000 # scale up logits to make them more confident when applying the softmax
+            lm_logits = logits.detach()  # Detach logits to prevent gradients from flowing back through them during loss computation
         
             # lm_logits = torch.cat(logits_list, dim=1)
             # _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
@@ -879,11 +881,11 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size)#, shift_labels=_labels)
             
             ## For debugging and analysis: compute argmax and softmax values for the current batch
-            # argmax = torch.argmax(lm_logits, dim=-1)
-            # argmax_value = torch.max(lm_logits, dim=-1)
-            # _lm_logits_softmax = torch.nn.functional.softmax(lm_logits, dim=-1)
-            # argmax_soft = torch.argmax(_lm_logits_softmax, dim=-1)
-            # argmax_value_soft = torch.max(_lm_logits_softmax, dim=-1)
+            argmax = torch.argmax(lm_logits, dim=-1)
+            argmax_value = torch.max(lm_logits, dim=-1)
+            _lm_logits_softmax = torch.nn.functional.softmax(lm_logits, dim=-1)
+            argmax_soft = torch.argmax(_lm_logits_softmax, dim=-1)
+            argmax_value_soft = torch.max(_lm_logits_softmax, dim=-1)
 
 
             batch_size = _labels.shape[0]
