@@ -815,7 +815,8 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         # tokenizer = None
         compute_accuracy=False,
-        starting_point=2
+        starting_point=9, #2
+        tokenizer=None
     ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
 
         starting_point = max(2, starting_point) 
@@ -845,6 +846,8 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             'padding_tokens_not_masked': 0,  # Padding tokens with label != -100
             'padding_tokens_correct': 0      # Padding tokens that were correctly predicted (if not masked)
         }
+
+        debug_predictions = list()
 
         for i in range(self.memo.chunk_length+starting_point, labels.shape[1]):
             if outputs is not None:
@@ -883,9 +886,38 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             ## For debugging and analysis: compute argmax and softmax values for the current batch
             argmax = torch.argmax(lm_logits, dim=-1)
             argmax_value = torch.max(lm_logits, dim=-1)
+            top_k = torch.topk(lm_logits, k=5, dim=-1)
+            
             _lm_logits_softmax = torch.nn.functional.softmax(lm_logits, dim=-1)
             argmax_soft = torch.argmax(_lm_logits_softmax, dim=-1)
             argmax_value_soft = torch.max(_lm_logits_softmax, dim=-1)
+            top_k_softmax = torch.topk(_lm_logits_softmax, k=5, dim=-1)
+
+            # get the probability of the expected label declared in _labels from _lm_logit_softmax
+            expected_label_prob = torch.gather(_lm_logits_softmax, dim=-1, index=_labels.unsqueeze(-1)).squeeze(-1)
+            expected_label_score = torch.gather(lm_logits, dim=-1, index=_labels.unsqueeze(-1)).squeeze(-1)
+            # batch_debug_info = dict()
+            if tokenizer is not None:
+                # decode the predicted token ids and expected token ids for the current batch
+                pred_tokens = tokenizer.batch_decode(argmax)
+                expected_tokens = tokenizer.batch_decode(_labels)
+                batch_debug_info = {
+                    'sequence_index': i,
+                    'input_sequence': tokenizer.batch_decode(current_batch['input_ids'], skip_special_tokens=True),
+                    'pred_tokens': pred_tokens,
+                    'pred_score': argmax_value.values.cpu().numpy().tolist(),
+                    'pred_score_softmax': argmax_value_soft.values.cpu().numpy().tolist(),
+                    'expected_tokens': expected_tokens,
+                    'expected_label_prob': expected_label_prob.cpu().numpy().tolist(),
+                    'expected_label_score': expected_label_score.cpu().numpy().tolist(),
+                    'loss': loss.detach().cpu().numpy().tolist(),
+                }
+                debug_predictions.append(batch_debug_info)
+                # print(f"Predicted tokens: {pred_tokens}")
+                # print(f"Expected tokens: {expected_tokens}")
+                # print(f"Expected token probabilities: {expected_label_prob}")
+                # print(f"Top 5 predicted tokens: {tokenizer.batch_decode(top_k.indices)}")
+                # print(f"Top 5 predicted token probabilities: {top_k.values}")
 
 
             batch_size = _labels.shape[0]
@@ -1014,6 +1046,16 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                 avg_nll=(total_nll_sum / num_tokens_predicted).detach().cpu().item() if num_tokens_predicted > 0 else 0.0,
                 num_tokens=num_tokens_predicted
             )
+        
+        batch_debug = dict(
+            ppl=accuracy_results['perplexity'],
+            avg_nll=accuracy_results['avg_nll'],
+            num_tokens=accuracy_results['num_tokens'],
+            accuracy=accuracy_results['accuracy'] if compute_accuracy else None,
+            correct_tokens=accuracy_results['correct_tokens'] if compute_accuracy else None,
+            total_tokens=accuracy_results['tot_tokens'] if compute_accuracy else None,
+            predictions=debug_predictions
+        )
 
         return MeMoCausalLMOutputWithPast(
             loss=total_loss,
@@ -1021,7 +1063,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             past_key_values=None, #outputs.past_key_values,
             hidden_states=None, #outputs.hidden_states,
             hidden_tokens=None, #outputs.hidden_tokens,
-        ), accuracy_results
+        ), accuracy_results, batch_debug
     
     
     def forward_with_loss_parallelized(

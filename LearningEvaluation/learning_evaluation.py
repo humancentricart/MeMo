@@ -158,15 +158,19 @@ def compute_ppl(model, tokenizer, device, data_iter, max_token_distrib_rank=10):
         padding_analysis=0
     )
     token_stats_aggregate = dict()
+
+    debug_predictions = list()
     
     for batch_examples in tqdm(data_iter):
         batch_inputs = tokenizer.get_text_batch_encoding_for_loss(text=batch_examples['text'])
 
         with torch.no_grad():
-            outputs, accuracy = model.forward_with_loss(
+            outputs, accuracy, batch_debug_info = model.forward_with_loss(
                 batch_inputs=batch_inputs,
-                compute_accuracy=True
+                compute_accuracy=True,
+                tokenizer=tokenizer # TODO: remove
             )
+            debug_predictions.append(batch_debug_info)
 
             # The forward_with_loss function now returns perplexity and avg_nll in accuracy dict
             batch_perplexity = accuracy.get('perplexity', 0.0)
@@ -251,7 +255,7 @@ def compute_ppl(model, tokenizer, device, data_iter, max_token_distrib_rank=10):
         token_stats_by_accuracy=token_stats_by_accuracy_str
     )
     res_dict.update(accuracy_aggregate)
-    return res_dict
+    return res_dict, debug_predictions
 
 
 def evaluate_memo(model_path, eval_datasets, batch_size=None):
@@ -277,7 +281,7 @@ def evaluate_memo(model_path, eval_datasets, batch_size=None):
     model.eval()
 
     with torch.no_grad():
-        ppl_res = compute_ppl(
+        ppl_res, debug_predictions = compute_ppl(
             model=model,
             tokenizer=tokenizer,
             device=device,
@@ -288,7 +292,7 @@ def evaluate_memo(model_path, eval_datasets, batch_size=None):
     results.update(ppl_res)
     del model, tokenizer
     torch.cuda.empty_cache()
-    return results
+    return results, debug_predictions
         
 
 def check_for_configuration(src_df, cfg):
@@ -332,7 +336,7 @@ def evaluate_single_batch_memo(model_path, batch_data, batch_size=None):
                 )
             )#LearningEvaluation/training_data/samples/mini/n=000020
     with torch.no_grad():
-        ppl_res = compute_ppl(
+        ppl_res, debug_predictions = compute_ppl(
             model=model,
             tokenizer=tokenizer,
             device=device,
@@ -341,7 +345,7 @@ def evaluate_single_batch_memo(model_path, batch_data, batch_size=None):
 
     del model, tokenizer
     torch.cuda.empty_cache()
-    return ppl_res
+    return ppl_res, debug_predictions
 
 
 
@@ -357,6 +361,11 @@ def experimental_management(params):
 
     if models_dir is not None and not os.path.exists(models_dir):
         os.makedirs(models_dir)
+    
+
+    debug_dir = mem_curve_eval_csv.replace('.csv', f"")
+    if not os.path.exists(debug_dir):
+        os.makedirs(debug_dir)
 
     train_df = pd.read_csv(train_csv) if os.path.exists(train_csv) else pd.DataFrame()
 
@@ -398,7 +407,7 @@ def experimental_management(params):
         ckpt_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
         if not check_for_configuration(src_df=eval_df, cfg=ckpt_cfg):
             # continue
-            results = evaluate_memo(
+            results, debug_predictions = evaluate_memo(
                 model_path=model_path,
                 eval_datasets=sample_datasets,
                 batch_size=eval_batch_size
@@ -421,11 +430,19 @@ def experimental_management(params):
             if check_for_configuration(src_df=mem_curve_df, cfg=_ckpt_cfg): continue
             with open(mem_batch_path) as f:
                 batch_data = json.load(f)
-            results = evaluate_single_batch_memo(
+            results, debug_predictions = evaluate_single_batch_memo(
                 model_path=model_path,
                 batch_data=batch_data,
                 batch_size=eval_batch_size
             )
+
+            print(f"batch accuracy: {results['accuracy']}")
+            if results['accuracy'] > .7:
+                debug_file = f"{os.path.join(debug_dir, convert_cfg_into_text(_ckpt_cfg))}.json"
+                if not os.path.exists(debug_file):
+                    with open(debug_file, 'w') as f:
+                        json.dump(debug_predictions, f, indent=4)
+
             _ckpt_cfg.update(results)
             # model_memorization_curve.append(ckpt_cfg)
             mem_curve_df = update_df_list(
