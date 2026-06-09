@@ -901,6 +901,13 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                 # decode the predicted token ids and expected token ids for the current batch
                 pred_tokens = tokenizer.batch_decode(argmax)
                 expected_tokens = tokenizer.batch_decode(_labels)
+                top_k_tokens_list = top_k.indices.reshape(top_k.indices.shape[0], -1).cpu().numpy().tolist()
+                top_k_predicted_tokens = [
+                    tokenizer.convert_ids_to_tokens(_top_k_tokens_list)
+                    for _top_k_tokens_list in top_k_tokens_list
+                ]
+                top_k_scores = top_k.values.reshape(top_k.values.shape[0], -1)
+                top_k_softmax_scores = top_k_softmax.values.reshape(top_k_softmax.values.shape[0], -1)
                 batch_debug_info = {
                     'sequence_index': i,
                     'input_sequence': tokenizer.batch_decode(current_batch['input_ids'], skip_special_tokens=True),
@@ -910,6 +917,9 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                     'expected_tokens': expected_tokens,
                     'expected_label_prob': expected_label_prob.cpu().numpy().tolist(),
                     'expected_label_score': expected_label_score.cpu().numpy().tolist(),
+                    'top_predicted_tokens': top_k_predicted_tokens,
+                    'top_predicted_token_scores': top_k_scores.cpu().numpy().tolist(),
+                    'top_predicted_tokens_softmax': top_k_softmax_scores.cpu().numpy().tolist(),
                     'loss': loss.detach().cpu().numpy().tolist(),
                 }
                 debug_predictions.append(batch_debug_info)
