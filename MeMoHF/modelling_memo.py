@@ -192,7 +192,8 @@ class MeMo(MeMoPreTrainedModel):
 
                 alpha_gen=1,
                 layerized_CMM_OUT = True,
-                compositionOp=CompositionOp.Prod
+                compositionOp=CompositionOp.Prod,
+                lambda_val=0.9,
         ): #, device=None):
         #super().__init__()
         
@@ -202,6 +203,8 @@ class MeMo(MeMoPreTrainedModel):
         self.max_len = self.h**self.l
         self.chunk_length = chunk_length
         self.layerized_CMM_OUT = layerized_CMM_OUT
+        self.lambda_val = lambda_val
+        
         
         if self.chunk_length/self.max_len != self.chunk_length//self.max_len:
             raise MeMoException("Chunk length "+ str(self.chunk_length) + \
@@ -528,8 +531,17 @@ class MeMo(MeMoPreTrainedModel):
             
             # This is to capture the layer by layer extraction of the next token: the output of each layer is normalized in order to 
             # penalize short sequences 
+            # if self.layerized_CMM_OUT: 
+            #     residual_stream += outputs['layered_out_token']
             if self.layerized_CMM_OUT: 
-                residual_stream += outputs['layered_out_token']
+                #residual_stream += outputs['layered_out_token']
+                # residual_stream = torch.linalg.norm(outputs['layered_out_token'] + self.lambda_val * residual_stream, dim=0, keepdim=True)
+                residual_stream = F.normalize(
+                    outputs['layered_out_token'] + self.lambda_val * residual_stream,
+                    p=2,
+                    dim=1
+                )
+            
 
 
         # Add last hidden state
