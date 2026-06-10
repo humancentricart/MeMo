@@ -940,6 +940,11 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                     'vocab_distrib_min_score': lm_logits.min(dim=-1).values.cpu().numpy().tolist(),
                     'vocab_distrib_min_score_softmax': _lm_logits_softmax.min(dim=-1).values.cpu().numpy().tolist(),
 
+                    'exp_vocab_distribution_score_sum': torch.exp(lm_logits).sum(dim=-1).cpu().numpy().tolist(),
+                    'exp_vocab_distribution_score_mean': torch.exp(lm_logits).mean(dim=-1).cpu().numpy().tolist(),
+                    'exp_vocab_distrib_min_score': torch.exp(lm_logits).min(dim=-1).values.cpu().numpy().tolist(),
+                    'exp_vocab_distrib_max_score': torch.exp(lm_logits).max(dim=-1).values.cpu().numpy().tolist(),
+
                     'loss': loss.detach().cpu().numpy().tolist(),
                 }
                 debug_predictions.append(batch_debug_info)
