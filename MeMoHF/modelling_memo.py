@@ -932,6 +932,14 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                     'top_predicted_tokens': top_k_predicted_tokens,
                     'top_predicted_token_scores': top_k_scores.cpu().numpy().tolist(),
                     'top_predicted_tokens_softmax': top_k_softmax_scores.cpu().numpy().tolist(),
+
+                    'vocab_distribution_score_sum': lm_logits.sum(dim=-1).cpu().numpy().tolist(),
+                    'vocab_distribution_score_mean': lm_logits.mean(dim=-1).cpu().numpy().tolist(),
+                    'vocab_distribution_score_sum_softmax': _lm_logits_softmax.sum(dim=-1).cpu().numpy().tolist(),
+                    'vocab_distribution_score_mean_softmax': _lm_logits_softmax.mean(dim=-1).cpu().numpy().tolist(),
+                    'vocab_distrib_min_score': lm_logits.min(dim=-1).values.cpu().numpy().tolist(),
+                    'vocab_distrib_min_score_softmax': _lm_logits_softmax.min(dim=-1).values.cpu().numpy().tolist(),
+
                     'loss': loss.detach().cpu().numpy().tolist(),
                 }
                 debug_predictions.append(batch_debug_info)
