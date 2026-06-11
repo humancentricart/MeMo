@@ -887,6 +887,15 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
 
             # lm_logits = (logits + 10) * 1000 # scale up logits to make them more confident when applying the softmax
             lm_logits = logits.detach()  # Detach logits to prevent gradients from flowing back through them during loss computation
+
+            # mask out all the logits whose scores are outside the 50 best tokens (top-k filtering), in order to consider only the top-k tokens for the loss computation using the softmax 
+            top_k = torch.topk(lm_logits, k=10, dim=-1)
+            top_k_indices = top_k.indices
+            top_k_values = top_k.values
+            mask = torch.full_like(lm_logits, float('-inf'))
+            mask.scatter_(dim=-1, index=top_k_indices, src=top_k_values)
+            lm_logits = mask * 10 #lm_logits + mask
+
         
             # lm_logits = torch.cat(logits_list, dim=1)
             # _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
