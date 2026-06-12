@@ -892,7 +892,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             top_k = torch.topk(lm_logits, k=50, dim=-1)
             top_k_indices = top_k.indices
             top_k_values = top_k.values
-            mask = torch.full_like(lm_logits, float('-inf'))
+            mask = torch.full_like(lm_logits, -12.0) #float('-inf'))
             mask.scatter_(dim=-1, index=top_k_indices, src=top_k_values)
             lm_logits = mask * 10 #lm_logits + mask
 
