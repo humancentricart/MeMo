@@ -889,7 +889,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             lm_logits = logits.detach()  # Detach logits to prevent gradients from flowing back through them during loss computation
 
             # mask out all the logits whose scores are outside the 50 best tokens (top-k filtering), in order to consider only the top-k tokens for the loss computation using the softmax 
-            top_k = torch.topk(lm_logits, k=10, dim=-1)
+            top_k = torch.topk(lm_logits, k=50, dim=-1)
             top_k_indices = top_k.indices
             top_k_values = top_k.values
             mask = torch.full_like(lm_logits, float('-inf'))
@@ -956,7 +956,26 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
 
                     'loss': loss.detach().cpu().numpy().tolist(),
                 }
+                # check all the fields of the batch_debug_info and convert inf or -inf to a string for better readability in the logs
+                # for key, value in batch_debug_info.items():
+                #     if isinstance(value, list):
+                #         batch_debug_info[key] = [v if not (isinstance(v, float) and (v == float('inf') or v == float('-inf'))) else str(v) for v in value]
+                #     elif isinstance(value, float) and (value == float('inf') or value == float('-inf')):
+                #         batch_debug_info[key] = str(value)
+                for key, value in batch_debug_info.items():
+                    if isinstance(value, list):
+                        if isinstance(value[0], list):
+                            batch_debug_info[key] = [[str(v) if str(v) in ['inf', '-inf'] else v for v in sublist] for sublist in value]
+                        else:
+                            batch_debug_info[key] = [str(v) if str(v) in ['inf', '-inf'] else v for v in value]
+                    elif isinstance(value, float) and (str(value) in ['inf', '-inf']):
+                        batch_debug_info[key] = str(value)
                 debug_predictions.append(batch_debug_info)
+                # if the loss is infinte for the current batch, print the debug information
+                if str(loss.detach().cpu().numpy().item()) in ['inf', '-inf']:
+                    print(f"Batch index: {i}")
+                    print(batch_debug_info)
+
                 # print(f"Predicted tokens: {pred_tokens}")
                 # print(f"Expected tokens: {expected_tokens}")
                 # print(f"Expected token probabilities: {expected_label_prob}")
