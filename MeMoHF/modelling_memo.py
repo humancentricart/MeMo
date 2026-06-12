@@ -972,9 +972,9 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                         batch_debug_info[key] = str(value)
                 debug_predictions.append(batch_debug_info)
                 # if the loss is infinte for the current batch, print the debug information
-                if str(loss.detach().cpu().numpy().item()) in ['inf', '-inf']:
-                    print(f"Batch index: {i}")
-                    print(batch_debug_info)
+                # if str(loss.detach().cpu().numpy().item()) in ['inf', '-inf']:
+                #     print(f"Batch index: {i}")
+                #     print(batch_debug_info)
 
                 # print(f"Predicted tokens: {pred_tokens}")
                 # print(f"Expected tokens: {expected_tokens}")
