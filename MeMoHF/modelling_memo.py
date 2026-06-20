@@ -861,6 +861,9 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
 
         debug_predictions = list()
 
+        if self.memo.chunk_length+starting_point >= labels.shape[1]:
+            return None, None, None 
+
         for i in range(self.memo.chunk_length+starting_point, labels.shape[1]):
             if outputs is not None:
                 del outputs

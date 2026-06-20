@@ -170,6 +170,7 @@ def compute_ppl(model, tokenizer, device, data_iter, max_token_distrib_rank=10):
                 compute_accuracy=True,
                 tokenizer=tokenizer # TODO: remove
             )
+            if batch_debug_info is None: continue
             debug_predictions.append(batch_debug_info)
 
             # The forward_with_loss function now returns perplexity and avg_nll in accuracy dict
