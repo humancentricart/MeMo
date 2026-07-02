@@ -210,7 +210,10 @@ class MeMo(MeMoPreTrainedModel):
             raise MeMoException("Chunk length "+ str(self.chunk_length) + \
                 " should be divisible for number of heads power numer of layers ("+str(self.max_len) +")")
         
-        self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights)
+        #self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights)
+        #### FMZ 2026-07-01 - Trying with different encodings for input and for unencoding 
+        self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights, padding_vector_component_values = 0.000001)        #### FMZ 2026-07-01 - Encoding in
+        self.output_encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights, padding_vector_component_values = 0.000002) #### FMZ 2026-07-01 - Encoding out
         self.layers = MeMoLayers(
             [
                 MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
@@ -258,7 +261,8 @@ class MeMo(MeMoPreTrainedModel):
     
     def memorize(self, input_ids, labels_ids):
         input_sequence = self.encoder.encode(input_ids)
-        output_symbols = self.encoder.encode(labels_ids)
+        # output_symbols = self.encoder.encode(labels_ids)
+        output_symbols = self.output_encoder.encode(labels_ids) #### FMZ 2026-07-01
         #print("input_sequence.shape", input_sequence.shape)
 
         (batch_size, current_length, d) = input_sequence.shape
@@ -317,7 +321,8 @@ class MeMo(MeMoPreTrainedModel):
                 inseq0 = input_sequence[0]
                 
                 if DEBUGGING:
-                    retreived_output_symbol_vector, max_value = self.encoder.decode(output_symbols)
+                    # retreived_output_symbol_vector, max_value = self.encoder.decode(output_symbols)
+                    retreived_output_symbol_vector, max_value = self.output_encoder.decode(output_symbols) ### FMZ 2026-07-01
                     print(retreived_output_symbol_vector)
 
                 ## update the input sequence for the next layer
@@ -337,7 +342,8 @@ class MeMo(MeMoPreTrainedModel):
     
     def forget(self, input_ids, labels_ids, completely=False):
         input_sequence =  self.encoder.encode(input_ids)
-        output_symbols = self.encoder.encode(labels_ids)
+        # output_symbols = self.encoder.encode(labels_ids)
+        output_symbols = self.output_encoder.encode(labels_ids) ### FMZ 2026-07-01
 
         (batch_size, current_length, d) = input_sequence.shape
         if current_length > self.chunk_length: # truncate the sequence considering only the last [chunk_length] tokens
@@ -384,7 +390,8 @@ class MeMo(MeMoPreTrainedModel):
                 input_sequence = input_sequence[:, input_index]
 
                 if DEBUGGING:
-                    retreived_output_symbol_vector, max_value = self.encoder.decode(output_symbols)
+                    # retreived_output_symbol_vector, max_value = self.encoder.decode(output_symbols)
+                    retreived_output_symbol_vector, max_value = self.output_encoder.decode(output_symbols) ### FMZ 2026-07-01
                     print(retreived_output_symbol_vector)
                 
                 input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].forget(input_sequence, 
@@ -581,7 +588,8 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.memo = MeMo(config)
-        self.lm_head = self.memo.encoder # same embedding and un-embedding matrix
+        #self.lm_head = self.memo.encoder # same embedding and un-embedding matrix
+        self.lm_head = self.memo.output_encoder # FMZ 2026-07-01 different embedding and un-embedding matrix
         # self.loss_function = ForCausalLMLoss
         # Initialize weights and apply final processing
         self.post_init()
