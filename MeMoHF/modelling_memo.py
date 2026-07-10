@@ -212,8 +212,8 @@ class MeMo(MeMoPreTrainedModel):
         
         #self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights)
         #### FMZ 2026-07-01 - Trying with different encodings for input and for unencoding 
-        self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights, padding_vector_component_values = 0.000001)        #### FMZ 2026-07-01 - Encoding in
-        self.output_encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights, padding_vector_component_values = 0.000002) #### FMZ 2026-07-01 - Encoding out
+        self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights, padding_vector_component_values = 0)        #### FMZ 2026-07-01 - Encoding in
+        self.output_encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights, padding_vector_component_values = 0) #### FMZ 2026-07-01 - Encoding out
         self.layers = MeMoLayers(
             [
                 MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
@@ -444,7 +444,9 @@ class MeMo(MeMoPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
+            ### This is the specific point where padding tokens are added
             inputs_embeds = self.encoder(input_ids)
+            #### 
         
         seq_length = inputs_embeds.shape[0]
 

@@ -195,6 +195,7 @@ from enum import Enum
 class CompositionOp(Enum):
     JLT = 1
     Prod = 2
+    Sum = 3
 
 
 class MeMoLayer(Module):
@@ -244,6 +245,9 @@ class MeMoLayer(Module):
             sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
         elif self.compOp == CompositionOp.JLT:
             sequence_encoding = self.Prj(input_sequence.reshape((batch_size, blocks, self.d * self.h)))
+        elif self.compOp == CompositionOp.Sum:
+            sequence_encoding = torch.sum(input_sequence,2)
+            sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
         else: 
             print("ERROR")
         # sequence_encoding = self.Prj(input_sequence.reshape((batch_size, blocks, self.d * self.h)))
