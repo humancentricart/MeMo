@@ -145,7 +145,8 @@ class MeMoEmbedding(Embedding):
 
         mean = None,
         std=None,
-        init_weights=True
+        init_weights=True,
+        padding_vector_component_values = 0  #### FMZ 2026-07-01
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super(Embedding, self).__init__() 
@@ -165,6 +166,7 @@ class MeMoEmbedding(Embedding):
         self.max_norm = max_norm
         self.norm_type = norm_type
         self.scale_grad_by_freq = scale_grad_by_freq
+        self.padding_vector_component_values = padding_vector_component_values  #### FMZ 2026-07-01
 
         ### MeMo initilialization
         if mean is None:
@@ -195,17 +197,30 @@ class MeMoEmbedding(Embedding):
     
     def reset_parameters(self) -> None:
         ### MeMo initilialization
-        print("MeMo embedding initilialization")
+        print("MeMo embedding initilialization: ", self.__class__.__name__)
+        print("Padding vector components : " , self.padding_vector_component_values)
         init.normal_(self.weight, mean=self.mean, std=self.std) # TODO add generator?
         #print(f"SHAPE: {self.weight.shape}")
         #self.weight.data = self.weight.data.view(-1)[torch.randperm(self.weight.data.numel())].reshape(self.weight.data.shape)
-        
-        self._fill_padding_idx_with_zero()
+        #self._fill_padding_idx_with_zero()
+        #self._fill_padding_idx_with_ones()
+        self._fill_padding_idx_with_component_values() #### FMZ 2026-07-01
 
     def _fill_padding_idx_with_zero(self) -> None:
         if self.padding_idx is not None:
             with torch.no_grad():
                 self.weight[self.padding_idx].fill_(0)
+
+    def _fill_padding_idx_with_ones(self) -> None:
+        if self.padding_idx is not None:
+            with torch.no_grad():
+                self.weight[self.padding_idx].fill_(1)
+
+    #### FMZ 2026-07-01 
+    def _fill_padding_idx_with_component_values(self) -> None:
+        if self.padding_idx is not None:
+            with torch.no_grad():
+                self.weight[self.padding_idx].fill_(self.padding_vector_component_values)
 
     def forward(self, input: Tensor) -> Tensor:
         return F.embedding(

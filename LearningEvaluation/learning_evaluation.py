@@ -24,7 +24,7 @@ from datasets import Dataset, DatasetDict, Features, Value, load_dataset, load_f
 from data_management import *
 
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 
@@ -57,7 +57,9 @@ def convert_text_into_cfg(text):
 # measure MEMO's PPL on full training set for each MEMO version
 
 memo_configs = [
-    dict(max_length=1024, d=1024, l=4, h=4)
+    # dict(max_length=1024, d=1024, l=4, h=4),
+    dict(max_length=4096, d=2048, l=6, h=4, alpha_gen=1, compositionOp='Prod'),
+    dict(max_length=4096, d=2048, l=6, h=4, alpha_gen=1, compositionOp='JLT'),
 ]
 
 def enable_train(model):
@@ -80,6 +82,9 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
                                         padding_side='left', model_max_length=memo_cfg['max_length'], 
                                         # head_number=memo_cfg['h']
                                         )
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.pad_token_id
+    
     config = MeMoConfig(vocab_size=len(tokenizer), #tokenizer.vocab_size, 
                hidden_size=memo_cfg['d'], 
                num_hidden_layers=memo_cfg['l'],
@@ -88,8 +93,13 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
                bos_token_id=tokenizer.bos_token_id,
                eos_token_id=tokenizer.eos_token_id,
                pad_token_id=tokenizer.pad_token_id,
-              )
-    model = MeMoForCausalLM(config).to('cuda')
+               alpha_gen=memo_cfg['alpha_gen'],
+               compositionOp=memo_cfg['compositionOp'],
+    )
+    model = MeMoForCausalLM(config)
+    model.training = True
+    model.train()
+    model.to('cuda')
     
 
     # data = data.shuffle(seed=42)
@@ -121,59 +131,138 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches):
     torch.cuda.empty_cache()
     # return model_name, model, tokenizer
 
-def compute_ppl(model, tokenizer, device, data_iter):
-    nll_sum = 0.0
-    n_tokens = 0
+def compute_ppl(model, tokenizer, device, data_iter, max_token_distrib_rank=10):
+    """
+    Compute perplexity and accuracy metrics on evaluation data.
+    
+    The model's forward_with_loss already computes perplexity internally with correct
+    loss accumulation. This function aggregates results across batches.
+    
+    Args:
+        model: MeMoForCausalLM model in evaluation mode
+        tokenizer: Tokenizer for token string conversion
+        device: Device to compute on
+        data_iter: Iterator over batches of examples
+        max_token_distrib_rank: Number of top tokens to track per metric
+        
+    Returns:
+        Dictionary with perplexity, NLL, accuracy, and token statistics
+    """
+    total_perplexity_weighted = 0.0  # Weighted sum of perplexities by num_tokens
+    total_tokens = 0  # Aggregate token count
+    total_nll_sum = 0.0  # Sum of all NLLs across batches
+    
     accuracy_aggregate = dict(
         correct_tokens=0,
-        tot_tokens=0
+        tot_tokens=0,
+        padding_analysis=0
     )
+    token_stats_aggregate = dict()
+
+    debug_predictions = list()
+    
     for batch_examples in tqdm(data_iter):
         batch_inputs = tokenizer.get_text_batch_encoding_for_loss(text=batch_examples['text'])
-        input_ids, target_ids = batch_inputs['input_ids'].to(device), batch_inputs['labels'].to(device)
 
         with torch.no_grad():
-            outputs, accuracy = model.forward_with_loss_parallelized(
+            outputs, accuracy, batch_debug_info = model.forward_with_loss(
                 batch_inputs=batch_inputs,
-                compute_accuracy=True
+                compute_accuracy=True,
+                tokenizer=tokenizer # TODO: remove
             )
+            if batch_debug_info is None: continue
+            debug_predictions.append(batch_debug_info)
 
-            # loss is calculated using CrossEntropyLoss which averages over valid labels
-            # N.B. the model only calculates loss over trg_len - 1 labels, because it internally shifts the labels
-            # to the left by 1.
-            neg_log_likelihood = outputs.loss
+            # The forward_with_loss function now returns perplexity and avg_nll in accuracy dict
+            batch_perplexity = accuracy.get('perplexity', 0.0)
+            batch_avg_nll = accuracy.get('avg_nll', 0.0)
+            batch_num_tokens = accuracy.get('num_tokens', 0)
         
         for k in accuracy:
-            if k not in accuracy_aggregate: continue
+            if k not in accuracy_aggregate: 
+                continue
             accuracy_aggregate[k] += accuracy[k]
         
-        # Accumulate the total negative log-likelihood and the total number of tokens
-        num_valid_tokens = (target_ids != -100).sum().item()  # number of valid tokens in target_ids
-        batch_size = target_ids.size(0)
-        num_loss_tokens = num_valid_tokens - batch_size  # subtract batch_size due to internal label shift
-        nll_sum += neg_log_likelihood * num_loss_tokens
-        n_tokens += num_loss_tokens
-        del batch_inputs, input_ids, target_ids, outputs, num_valid_tokens, num_loss_tokens, neg_log_likelihood
+        # Aggregate token statistics
+        if 'token_stats' in accuracy:
+            for token_id in accuracy['token_stats']:
+                if token_id not in token_stats_aggregate:
+                    token_stats_aggregate[token_id] = dict(
+                        target_count=accuracy['token_stats'][token_id]['target_count'],
+                        correct_count=accuracy['token_stats'][token_id]['correct_count'],
+                    )
+                else:
+                    token_stats_aggregate[token_id]['correct_count'] += accuracy['token_stats'][token_id]['correct_count']
+                    token_stats_aggregate[token_id]['target_count'] += accuracy['token_stats'][token_id]['target_count']
+        
+        # Accumulate NLL sum and tokens for final perplexity computation
+        if batch_num_tokens > 0:
+            # NLL sum for this batch = batch_avg_nll * batch_num_tokens
+            batch_nll_sum = batch_avg_nll * batch_num_tokens
+            total_nll_sum += batch_nll_sum
+            total_tokens += batch_num_tokens
+        
+        del batch_inputs, outputs, accuracy
         torch.cuda.empty_cache()
-        # idx += 1
-        # if idx > 0:
-        #     break
     
-    avg_nll = nll_sum / n_tokens  # average negative log-likelihood per token
-    ppl = torch.exp(avg_nll)
+    # Convert token_stats_aggregate into list of dicts with token strings
+    token_stats_list = list()
+    for token_id in token_stats_aggregate:
+        try:
+            token_str = tokenizer.convert_ids_to_tokens(int(token_id))
+        except:
+            token_str = f"<token_{token_id}>"
+        
+        token_stats_list.append(
+            dict(
+                token=token_str,
+                correct_count=token_stats_aggregate[token_id]['correct_count'],
+                target_count=token_stats_aggregate[token_id]['target_count'],
+                accuracy=token_stats_aggregate[token_id]['correct_count']/token_stats_aggregate[token_id]['target_count']
+            )
+        )
+    
+    # Create rankings by different metrics
+    token_stats_by_correct = sorted(token_stats_list, key=lambda x: x['correct_count'], reverse=True)[:max_token_distrib_rank]
+    token_stats_by_accuracy = sorted(token_stats_list, key=lambda x: x['accuracy'], reverse=True)[:max_token_distrib_rank]
+
+    # Format as strings
+    token_stats_by_correct_count = '\n'.join([
+        f"{i+1}. [{s['token']}] ({s['correct_count']}/{s['target_count']}, {s['accuracy']*100:.2f}%)"
+        for i, s in enumerate(token_stats_by_correct)
+    ])
+    token_stats_by_accuracy_str = '\n'.join([
+        f"{i+1}. [{s['token']}] ({s['correct_count']}/{s['target_count']}, {s['accuracy']*100:.2f}%)"
+        for i, s in enumerate(token_stats_by_accuracy)
+    ])
+
+    # Compute final metrics
+    if total_tokens > 0:
+        avg_nll = total_nll_sum / total_tokens
+        ppl = np.exp(avg_nll)
+    else:
+        avg_nll = 0.0
+        ppl = 0.0
+    
+    accuracy_value = (accuracy_aggregate['correct_tokens'] / accuracy_aggregate['tot_tokens']) if accuracy_aggregate['tot_tokens'] > 0 else 0.0
+    
     res_dict = dict(
-        n_tokens=n_tokens,
-        avg_nll=avg_nll.detach().cpu().item(),
-        ppl=ppl.detach().cpu().item(),
-        accuracy=accuracy_aggregate['correct_tokens']/accuracy_aggregate['tot_tokens']
+        n_tokens=total_tokens,
+        avg_nll=avg_nll,
+        ppl=ppl,
+        accuracy=accuracy_value,
+        padding_analysis=accuracy_aggregate['padding_analysis'],
+        token_stats_by_correct_count=token_stats_by_correct_count,
+        token_stats_by_accuracy=token_stats_by_accuracy_str
     )
     res_dict.update(accuracy_aggregate)
-    return res_dict
+    return res_dict, debug_predictions
 
 
 def evaluate_memo(model_path, eval_datasets, batch_size=None):
     if batch_size is None:
         batch_size = model_train_cfg['batch_size']
+    batch_size = 1 # forced restriction due to issues with batch evaluation
     seed_everything(42)
     model_train_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
     data_name = model_train_cfg.get('data_name', '')
@@ -187,12 +276,13 @@ def evaluate_memo(model_path, eval_datasets, batch_size=None):
 
     tokenizer = MeMoTokenizer.from_pretrained(model_path)
     model = MeMoForCausalLM.from_pretrained(model_path, device_map="auto")
+    model.to('cuda')
     device = model.memo.device
     
     model.eval()
 
     with torch.no_grad():
-        ppl_res = compute_ppl(
+        ppl_res, debug_predictions = compute_ppl(
             model=model,
             tokenizer=tokenizer,
             device=device,
@@ -203,7 +293,7 @@ def evaluate_memo(model_path, eval_datasets, batch_size=None):
     results.update(ppl_res)
     del model, tokenizer
     torch.cuda.empty_cache()
-    return results
+    return results, debug_predictions
         
 
 def check_for_configuration(src_df, cfg):
@@ -227,11 +317,13 @@ def equal_dicts(dict_a, dict_b, ignore_keys):
 
 
 def evaluate_single_batch_memo(model_path, batch_data, batch_size=None):
+    batch_size = 1 # forced restriction due to issues with batch evaluation 
     seed_everything(42)
     model_train_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
 
     tokenizer = MeMoTokenizer.from_pretrained(model_path)
     model = MeMoForCausalLM.from_pretrained(model_path, device_map="auto")
+    model.to('cuda')
     device = model.memo.device
     
     model.eval()
@@ -243,12 +335,9 @@ def evaluate_single_batch_memo(model_path, batch_data, batch_size=None):
                 dict(
                     text=batch_data['text'][i:i+batch_size]
                 )
-            )
-    else:
-        data_iter = [batch_data]
-
+            )#LearningEvaluation/training_data/samples/mini/n=000020
     with torch.no_grad():
-        ppl_res = compute_ppl(
+        ppl_res, debug_predictions = compute_ppl(
             model=model,
             tokenizer=tokenizer,
             device=device,
@@ -257,7 +346,7 @@ def evaluate_single_batch_memo(model_path, batch_data, batch_size=None):
 
     del model, tokenizer
     torch.cuda.empty_cache()
-    return ppl_res
+    return ppl_res, debug_predictions
 
 
 
@@ -271,6 +360,14 @@ def experimental_management(params):
     mem_curve_eval_csv = params.mem_curve_eval_csv
     sample_datasets = load_datasets_list(data_dir=data_dir)
 
+    if models_dir is not None and not os.path.exists(models_dir):
+        os.makedirs(models_dir)
+    
+
+    debug_dir = mem_curve_eval_csv.replace('.csv', f"")
+    if not os.path.exists(debug_dir):
+        os.makedirs(debug_dir)
+
     train_df = pd.read_csv(train_csv) if os.path.exists(train_csv) else pd.DataFrame()
 
     # # training
@@ -280,6 +377,7 @@ def experimental_management(params):
             data_name = os.path.basename(data_sample)
             for memo_cfg in memo_configs:
                 save_every_k_batches=int((len(data['train'])/batch_size)/5)
+                if save_every_k_batches < 1: save_every_k_batches = 1
                 train_cfg = dict(
                     batch_size=batch_size,
                     data_name=data_name,
@@ -310,7 +408,7 @@ def experimental_management(params):
         ckpt_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
         if not check_for_configuration(src_df=eval_df, cfg=ckpt_cfg):
             # continue
-            results = evaluate_memo(
+            results, debug_predictions = evaluate_memo(
                 model_path=model_path,
                 eval_datasets=sample_datasets,
                 batch_size=eval_batch_size
@@ -333,11 +431,19 @@ def experimental_management(params):
             if check_for_configuration(src_df=mem_curve_df, cfg=_ckpt_cfg): continue
             with open(mem_batch_path) as f:
                 batch_data = json.load(f)
-            results = evaluate_single_batch_memo(
+            results, debug_predictions = evaluate_single_batch_memo(
                 model_path=model_path,
                 batch_data=batch_data,
                 batch_size=eval_batch_size
             )
+
+            print(f"batch accuracy: {results['accuracy']}")
+            if results['accuracy'] > .7:
+                debug_file = f"{os.path.join(debug_dir, convert_cfg_into_text(_ckpt_cfg))}.json"
+                if not os.path.exists(debug_file):
+                    with open(debug_file, 'w') as f:
+                        json.dump(debug_predictions, f, indent=4)
+
             _ckpt_cfg.update(results)
             # model_memorization_curve.append(ckpt_cfg)
             mem_curve_df = update_df_list(
@@ -354,11 +460,11 @@ def experimental_management(params):
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data_dir', default='training_data/samples')
+parser.add_argument('--data_dir', default='training_data/samples/exps') #samples')
 parser.add_argument('--models_dir', default='models')
 parser.add_argument('--seeds', default=[42])
-parser.add_argument('--batch_size', default=1)
-parser.add_argument('--eval_batch_size', default=1)
+parser.add_argument('--batch_size', default=2)
+parser.add_argument('--eval_batch_size', default=2)
 parser.add_argument('--train_csv', default='memo_trained.csv')
 parser.add_argument('--eval_csv', default='memo_ppl_train_eval.csv')
 parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval.csv')
