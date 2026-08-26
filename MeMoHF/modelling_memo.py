@@ -169,6 +169,7 @@ class MeMo(MeMoPreTrainedModel):
             chunk_length=config.chunk_length, 
             num_embeddings=config.vocab_size,
             padding_idx=config.pad_token_id,
+            padding_seq_idx=config.padding_seq_idx, 
             init_weights=False, ## disable the initialization of weights from the constructor (done in the post_init)
 
             alpha_gen=config.alpha_gen,
@@ -187,7 +188,8 @@ class MeMo(MeMoPreTrainedModel):
                 num_of_layers, 
                 chunk_length, 
                 num_embeddings, 
-                padding_idx=0, 
+                padding_idx=0,
+                padding_seq_idx=-1,  
                 init_weights=True,
 
                 alpha_gen=1,
@@ -206,14 +208,16 @@ class MeMo(MeMoPreTrainedModel):
         self.lambda_val = lambda_val
         
         
-        if self.chunk_length/self.max_len != self.chunk_length//self.max_len:
-            raise MeMoException("Chunk length "+ str(self.chunk_length) + \
-                " should be divisible for number of heads power numer of layers ("+str(self.max_len) +")")
+        # if self.chunk_length/self.max_len != self.chunk_length//self.max_len:
+        #     raise MeMoException("Chunk length "+ str(self.chunk_length) + \
+        #         " should be divisible for number of heads power numer of layers ("+str(self.max_len) +")")
         
         #self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights)
         #### FMZ 2026-07-01 - Trying with different encodings for input and for unencoding 
-        self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights, padding_vector_component_values = 0)        #### FMZ 2026-07-01 - Encoding in
-        self.output_encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights, padding_vector_component_values = 0) #### FMZ 2026-07-01 - Encoding out
+        self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, padding_seq_idx=padding_seq_idx, 
+                                     init_weights=init_weights, padding_vector_component_values = 0)        #### FMZ 2026-07-01 - Encoding in
+        self.output_encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, padding_seq_idx=padding_seq_idx, 
+                                            init_weights=init_weights, padding_vector_component_values = 0) #### FMZ 2026-07-01 - Encoding out
         self.layers = MeMoLayers(
             [
                 MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
@@ -221,6 +225,68 @@ class MeMo(MeMoPreTrainedModel):
             ]
         )
 
+    def generate_sequences(self, input_seqs, layer: int):
+        h = self.h
+        batch_size, seq_len, hidden_dim = input_seqs.shape
+        device = input_seqs.device
+
+        # Distance between selected positions
+        step = h ** layer
+
+        # Construct:
+        #
+        # layer=0, h=4
+        #
+        # [-1, -1, -1,  0]
+        # [-1, -1,  0,  1]
+        # [-1,  0,  1,  2]
+        # [ 0,  1,  2,  3]
+        # layer=1, h=4
+        # [-1, -1, -1,  0],
+        # [-1, -1, -1,  1],
+        # [-1, -1, -1,  2],
+        # [-1, -1, -1,  3],
+        # [-1, -1,  0,  4],
+        # [-1, -1,  1,  5],
+        # [-1, -1,  2,  6],
+        # [-1, -1,  3,  7],
+        # [-1,  0,  4,  8],
+        # ...
+        positions = torch.arange(seq_len, device=device)
+
+        offsets = (
+            torch.arange(h, device=device) - (h - 1)
+        ) * step
+
+        whento = positions[:, None] + offsets[None, :]
+
+        # Everything before the sequence becomes PAD = -1
+        whento = whento.clamp(min=-1)
+        if DEBUGGING:
+            print("whento (selected indexes for layer ", layer, "):", whento)
+
+        # Keep track of padding positions
+        valid = whento != -1
+
+        # Replace -1 with 0 temporarily for indexing
+        gather_indices = whento.clamp(min=0)
+
+        # [batch, seq_len, h, hidden_dim]
+        new_seqs = input_seqs[:, gather_indices]
+
+        # Padding embedding
+        padding = self.encoder.weight[
+            self.encoder.padding_seq_idx
+        ].view(1, 1, 1, hidden_dim)
+
+        # Replace invalid gathered values with padding
+        new_seqs = torch.where(
+            valid[None, :, :, None],
+            new_seqs,
+            padding
+        )
+
+        return new_seqs
         
     
     def forward(
@@ -263,16 +329,18 @@ class MeMo(MeMoPreTrainedModel):
         input_sequence = self.encoder.encode(input_ids)
         # output_symbols = self.encoder.encode(labels_ids)
         output_symbols = self.output_encoder.encode(labels_ids) #### FMZ 2026-07-01
-        #print("input_sequence.shape", input_sequence.shape)
+        
 
         (batch_size, current_length, d) = input_sequence.shape
-        if current_length > self.chunk_length: # truncate the sequence considering only the last [chunk_length] tokens
-            input_sequence = input_sequence[:, -self.chunk_length:, :]
-        (batch_size, current_length, d) = input_sequence.shape
-        assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
+
+        # TODO check what are the implication with the new rule for selection
+        # if current_length > self.chunk_length: # truncate the sequence considering only the last [chunk_length] tokens
+        #     input_sequence = input_sequence[:, -self.chunk_length:, :]
+        # (batch_size, current_length, d) = input_sequence.shape
+        # assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
         
         last_layer = self.layers[self.l-1]
-        current_length = self.chunk_length
+        #current_length = self.chunk_length
         
         #for layer_level in range(self.l):
         #    current_length = current_length//self.h
@@ -288,50 +356,21 @@ class MeMo(MeMoPreTrainedModel):
         #    last_layer.directly_memorize(seq_encoding_for_the_last_layer)
 
         for layer_level in range(self.l):
-            if self.h ** (layer_level + 1) < current_length + 1:
-                ## update the input sequence for the next layer
-                layer_output_idxs = [
-                    i - self.h ** ((layer_level + 1) - 1) 
-                    for i in range(
-                        self.h ** (layer_level + 1), 
-                        current_length + 1
-                    )
-                ]
-                output_symbols = output_symbols[:, layer_output_idxs]
-                #print(output_symbols.shape)
-                output_ids = labels_ids[:, layer_output_idxs][0]
-                oids = layer_output_idxs[0]
+            input_sequence = self.generate_sequences(input_seqs=input_sequence, layer=layer_level)
+            
+            if DEBUGGING:
+                if layer_level == 0:
+                    print("Decoding input_sequence at layer 0")
+                    print(self.encoder.decode(input_sequence))
+                retreived_output_symbol_vector, max_value = self.output_encoder.decode(output_symbols) ### FMZ 2026-07-01
+                print(f"Layer {layer_level} - Output Sequence: {retreived_output_symbol_vector}")
                 
-                input_index = [
-                    [
-                        j for j in range(
-                            i - self.h ** (layer_level + 1), 
-                            i, 
-                            self.h ** ((layer_level + 1) - 1)
-                        )   
-                    ] 
-                    for i in range(
-                        self.h ** (layer_level + 1), 
-                        current_length + 1
-                    )
-                ]
-                input_sequence = input_sequence[:, input_index]
-                in_ids = input_ids[:, input_index][0]
-                iids = input_index[0]
-                inseq0 = input_sequence[0]
-                
-                if DEBUGGING:
-                    # retreived_output_symbol_vector, max_value = self.encoder.decode(output_symbols)
-                    retreived_output_symbol_vector, max_value = self.output_encoder.decode(output_symbols) ### FMZ 2026-07-01
-                    print(retreived_output_symbol_vector)
 
-                ## update the input sequence for the next layer
-                input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].memorize(input_sequence, 
-                                                                                                    output_symbols, 
-                                                                                                    is_last=(layer_level == self.l-1))
-                last_layer.directly_memorize(seq_encoding_for_the_last_layer)
-            else:
-                break
+            ## update the input sequence for the next layer
+            input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].memorize(input_sequence, 
+                                                                                                output_symbols, 
+                                                                                                is_last=(layer_level == self.l-1))
+            last_layer.directly_memorize(seq_encoding_for_the_last_layer)
         
     
     def memorize_text(self, memo_input):
@@ -340,68 +379,26 @@ class MeMo(MeMoPreTrainedModel):
                       memo_input['labels'].to(self.device))
         
     
-    def forget(self, input_ids, labels_ids, completely=False):
-        input_sequence =  self.encoder.encode(input_ids)
-        # output_symbols = self.encoder.encode(labels_ids)
-        output_symbols = self.output_encoder.encode(labels_ids) ### FMZ 2026-07-01
+    def forget(self, input_sequence_ids, labels_ids, completely=True):
+        input_sequence = self.encoder.encode(input_sequence_ids)
+        output_symbols = self.output_encoder.encode(labels_ids) #### FMZ 2026-07-01
 
         (batch_size, current_length, d) = input_sequence.shape
-        if current_length > self.chunk_length: # truncate the sequence considering only the last [chunk_length] tokens
-            input_sequence = input_sequence[:, -self.chunk_length:, :]
-        (batch_size, current_length, d) = input_sequence.shape
-        assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
+        #assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
         
         last_layer = self.layers[self.l-1]
-        current_length = self.chunk_length
         
-        #for layer_level in range(self.l):
-        #    current_length = current_length//self.h
-        #    input_sequence = input_sequence.reshape((batch_size, current_length, self.h, self.d))
         
-        #    #print(f"per layer {layer_level} input_sequence.shape", input_sequence.shape)
-        #    #print(input_sequence[0])    
-        #    output_symbols = output_symbols[:, [(x+1)*self.h-1 for x in range(0, current_length)]]
-    
-        #    ## update the input sequence for the next layer
-        #    input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].forget(input_sequence, 
-        #                                                                                      output_symbols, 
-        #                                                                                      completely=completely,
-        #                                                                                      is_last=(layer_level == self.l-1))
-        #    
-        #    last_layer.directly_forget(seq_encoding_for_the_last_layer)
-
         for layer_level in range(self.l):
-            #current_length = current_length//self.h
-            #input_sequence = input_sequence.reshape((batch_size, current_length, self.h, self.d))
-        
-            ##print(f"per layer {layer_level} input_sequence.shape", input_sequence.shape)
-            ##print(input_sequence[0])    
-            #output_symbols = output_symbols[:, [(x+1)*self.h-1 for x in range(0, current_length)]] ## the output symbol is always the same tokem?
-
+            input_sequence = self.generate_sequences(input_seqs=input_sequence, layer=layer_level)
+            ## TODO how to debug now? 
+            input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].forget(input_sequence, 
+                                                                                                output_symbols, 
+                                                                                                completely=completely,
+                                                                                                is_last= (layer_level == self.l-1) )
             
-            if self.h ** (layer_level + 1) < current_length + 1:
-                ## update the input sequence for the next layer
-                layer_output_idxs = [i - self.h ** ((layer_level + 1) - 1) for i in range(self.h ** (layer_level + 1), current_length + 1)]
-                output_symbols = output_symbols[:, layer_output_idxs]
-                #print(output_symbols.shape)
-                
-                input_index = [[j for j in range(i - self.h ** (layer_level + 1), i, self.h ** ((layer_level + 1) - 1))] 
-                               for i in range(self.h ** (layer_level + 1), current_length + 1)]
-                input_sequence = input_sequence[:, input_index]
-
-                if DEBUGGING:
-                    # retreived_output_symbol_vector, max_value = self.encoder.decode(output_symbols)
-                    retreived_output_symbol_vector, max_value = self.output_encoder.decode(output_symbols) ### FMZ 2026-07-01
-                    print(retreived_output_symbol_vector)
-                
-                input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].forget(input_sequence, 
-                                                                                                  output_symbols, 
-                                                                                                  completely=completely,
-                                                                                                  is_last= (layer_level == self.l-1) )
-                
-                last_layer.directly_forget(seq_encoding_for_the_last_layer)
-            else:
-                break
+            last_layer.directly_forget(seq_encoding_for_the_last_layer)
+            
         
         
     
@@ -445,7 +442,7 @@ class MeMo(MeMoPreTrainedModel):
 
         if inputs_embeds is None:
             ### This is the specific point where padding tokens are added
-            inputs_embeds = self.encoder(input_ids)
+            inputs_embeds = self.encoder.encode(input_ids)
             #### 
         
         seq_length = inputs_embeds.shape[0]
@@ -461,13 +458,13 @@ class MeMo(MeMoPreTrainedModel):
         sequence_representation = inputs_embeds
 
         (batch_size, current_length, d) = sequence_representation.shape
-        if current_length > self.chunk_length: # truncate the sequence considering only the last [chunk_length] tokens
-            sequence_representation = sequence_representation[:, -self.chunk_length:, :]
-        (batch_size, current_length, d) = sequence_representation.shape
-        assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
+        # if current_length > self.chunk_length: # truncate the sequence considering only the last [chunk_length] tokens
+        #     sequence_representation = sequence_representation[:, -self.chunk_length:, :]
+        # (batch_size, current_length, d) = sequence_representation.shape
+        # assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
         
         encoding_for_the_last_layer = torch.zeros((batch_size, self.d)).to(self.device)
-        current_length = self.chunk_length #min(self.chunk_length, self.max_len)
+        #current_length = self.chunk_length #min(self.chunk_length, self.max_len)
         
         
         if self.layerized_CMM_OUT: 
@@ -518,8 +515,7 @@ class MeMo(MeMoPreTrainedModel):
         #    #    print((retreived_output_symbol_vector, score_max))
 
         for layer_level in range(self.l):
-            current_length = int(current_length/self.h)
-            sequence_representation = sequence_representation.reshape((batch_size, current_length, self.h, self.d))
+            sequence_representation = self.generate_sequences(input_seqs=sequence_representation, layer=layer_level)
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (sequence_representation,)
