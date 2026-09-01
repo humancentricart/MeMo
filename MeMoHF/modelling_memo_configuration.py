@@ -40,6 +40,7 @@ class MeMoConfig(PretrainedConfig):
         padding_seq_idx=-1,
         alpha_gen=1,
         compositionOp='Prod', #choose between [Prod, JLT], case insensitive
+        padding_vector_component_values=0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -70,7 +71,7 @@ class MeMoConfig(PretrainedConfig):
 
         self.alpha_gen = alpha_gen
         self.compositionOp = compositionOp.lower()
-
+        self.padding_vector_component_values=padding_vector_component_values
         super().__init__(bos_token_id=bos_token_id, 
                          eos_token_id=eos_token_id, 
                          pad_token_id=pad_token_id, **kwargs)

@@ -175,7 +175,6 @@ class MeMoEmbedding(Embedding):
                 ), "padding_seq_idx must be within num_embeddings"
                 padding_seq_idx = self.num_embeddings + padding_seq_idx
         self.padding_seq_idx = padding_seq_idx
-        self.num_embeddings += 1
         self.max_norm = max_norm
         self.norm_type = norm_type
         self.scale_grad_by_freq = scale_grad_by_freq
@@ -189,7 +188,7 @@ class MeMoEmbedding(Embedding):
         
         #if _weight is None:
         self.weight = Parameter(
-            torch.empty((num_embeddings, embedding_dim), **factory_kwargs),
+            torch.empty((self.num_embeddings, self.embedding_dim), **factory_kwargs),
             requires_grad=not _freeze,
         )
 
@@ -232,8 +231,7 @@ class MeMoEmbedding(Embedding):
 
     def _fill_padding_seq_idx_with_one(self) -> None:
             with torch.no_grad():
-                ### or 1/sqrt(d) ?? gianca [no test]
-                self.weight[self.padding_seq_idx].fill_(0) ############# temporary solution, should be filled with ones but it breaks the decoding of the sequence
+                self.weight[self.padding_seq_idx].fill_(self.padding_vector_component_values) 
 
     #### FMZ 2026-07-01 
     def _fill_padding_idx_with_component_values(self) -> None:
