@@ -209,6 +209,7 @@ class MeMo(MeMoPreTrainedModel):
         self.lambda_val = lambda_val
 
         self.padding_vector_component_values = padding_vector_component_values
+        print("Padding input tokens in MeMo architecture: ", self.padding_vector_component_values)
         
         # if self.chunk_length/self.max_len != self.chunk_length//self.max_len:
         #     raise MeMoException("Chunk length "+ str(self.chunk_length) + \
@@ -280,7 +281,7 @@ class MeMo(MeMoPreTrainedModel):
         padding = self.encoder.weight[
             self.encoder.padding_seq_idx
         ].view(1, 1, 1, hidden_dim)
-
+        # print("Padding:", padding)
         # Replace invalid gathered values with padding
         new_seqs = torch.where(
             valid[None, :, :, None],
@@ -344,9 +345,10 @@ class MeMo(MeMoPreTrainedModel):
         # assert input_ids.dtype == torch.long
         # assert input_ids.min().item() >= 0
         # assert input_ids.max().item() < self.encoder.weight.shape[0]
-        
+        #print("INPUT SEQUENCES")
         input_sequence = self.encoder.encode(input_ids)
         # output_symbols = self.encoder.encode(labels_ids)
+        #print("OUTPUT SEQUENCES")
         output_symbols = self.output_encoder.encode(labels_ids) #### FMZ 2026-07-01
         
 

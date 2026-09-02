@@ -154,7 +154,7 @@ class TrainedMeMoTokenizer(
         truncation_side="left",
         padding_side="left",
         model_max_length=None,
-        vocab_size=10_000,
+        vocab_size=20_000,
         batch_size=1_000,
     ):
 

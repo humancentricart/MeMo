@@ -179,7 +179,7 @@ class MeMoEmbedding(Embedding):
         self.norm_type = norm_type
         self.scale_grad_by_freq = scale_grad_by_freq
         self.padding_vector_component_values = padding_vector_component_values  #### FMZ 2026-07-01
-
+        print(self.__class__.__name__, self.padding_vector_component_values)
         ### MeMo initilialization
         if mean is None:
             self.mean = 0
@@ -266,7 +266,9 @@ class MeMoEmbedding(Embedding):
 
 
     def encode(self, input:Tensor) -> Tensor:
-        return self.forward(input)
+        out = self.forward(input)
+        #print("out for embedding: ", out)
+        return out
     
     ### usage as unembedding matrix, used in CausaLMHead 
     def lm_logits(self, input_embeddings):

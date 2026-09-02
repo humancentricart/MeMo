@@ -127,6 +127,7 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches, trai
         padding_seq_idx=tokenizer.pad_token_id, # ### TODO changed to run this exact code
         alpha_gen=memo_cfg['alpha_gen'],
         compositionOp=memo_cfg['compositionOp'],
+        padding_vector_component_values=memo_cfg['padding_vector_component_values']
     )
     model = MeMoForCausalLM(config)
     model.training = True
@@ -512,16 +513,16 @@ parser.add_argument('--data_dir', default='original_training_data/new_sample/min
 # parser.add_argument('--data_dir', default='training_data/new_sample/scaling') #samples')
 # parser.add_argument('--models_dir', default='models_scale_1k')
 parser.add_argument('--train_custom_tokenizer', default=False)
-parser.add_argument('--models_dir', default='models_scale_pad_testing_7_unfoldv2_1d')
+parser.add_argument('--models_dir', default='models_scale_pad_testing_6_unfoldv2_correct1d')
 parser.add_argument('--seeds', default=[42])
 parser.add_argument('--batch_size', default=2)
 parser.add_argument('--eval_batch_size', default=2)
 # parser.add_argument('--train_csv', default='memo_trained_scale_1k.csv')
 # parser.add_argument('--eval_csv', default='memo_ppl_train_eval_scale_1k.csv')
 # parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval_scale_1k.csv')
-parser.add_argument('--train_csv', default='memo_trained_scale_pad_testing_7_unfoldv2_1d.csv')
-parser.add_argument('--eval_csv', default='memo_ppl_train_eval_scale_pad_testing_7_unfoldv2_1d.csv')
-parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval_scale_pad_testing_7_unfoldv2_1d.csv')
+parser.add_argument('--train_csv', default='memo_trained_scale_pad_testing_6_unfoldv2_correct1d.csv')
+parser.add_argument('--eval_csv', default='memo_ppl_train_eval_scale_pad_testing_6_unfoldv2_correct1d.csv')
+parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval_scale_pad_testing_6_unfoldv2_correct1d.csv')
 # parser.add_argument('--')
 
 
