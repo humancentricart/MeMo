@@ -489,7 +489,7 @@ class MeMo(MeMoPreTrainedModel):
         
         
         if self.layerized_CMM_OUT: 
-            residual_stream = torch.zeros((batch_size, self.d)).to(self.device)
+            residual_stream = torch.zeros((batch_size, self.chunk_length, self.d)).to(self.device)
 
         
         # moved outside the logic for tokenization, here only assertiion above
@@ -949,7 +949,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             argmax_soft = torch.argmax(_lm_logits_softmax, dim=-1)
             argmax_value_soft = torch.max(_lm_logits_softmax, dim=-1)
             top_k_softmax = torch.topk(_lm_logits_softmax, k=5, dim=-1)
-
+            
             # get the probability of the expected label declared in _labels from _lm_logit_softmax
             expected_label_prob = torch.gather(_lm_logits_softmax, dim=-1, index=_labels.unsqueeze(-1)).squeeze(-1)
             expected_label_score = torch.gather(lm_logits, dim=-1, index=_labels.unsqueeze(-1)).squeeze(-1)
@@ -1163,8 +1163,6 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             hidden_states=None, #outputs.hidden_states,
             hidden_tokens=None, #outputs.hidden_tokens,
         ), accuracy_results, batch_debug
-    
-    
 
 
     def forward_with_loss_unfold_v1( ####### ESR implmented and tested
@@ -1476,297 +1474,143 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         ), accuracy_results, batch_debug
 
 
-    def forward_with_loss_unfold(
+
+    ### ESR 2026-09-08
+    def forward_with_loss_simple(
         self,
         batch_inputs,
         return_dict: Optional[bool] = None,
         compute_accuracy=False,
-        starting_point=9,
+        starting_point=0,
         tokenizer=None,
-        window_batch_size: int = 16,  # number of sliding-window positions batched into a single forward() call
     ) -> Optional[Union[Tuple[torch.Tensor], "MeMoCausalLMOutputWithPast"]]:
         """
-        Parallelized + cleaned-up version of forward_with_loss.
+        Simplified forward_with_loss for models whose forward() already scores an
+        entire sequence in one call.
      
+        Given batch_inputs['input_ids'] and batch_inputs['labels'], both (B, seq_len),
+        a single self.forward(input_ids=input_ids, labels=labels) call returns
+        outputs.logits of shape (B, seq_len, vocab_size), where logits[:, p, :] is
+        the model's prediction distribution for the token at position p, aligned
+        directly with labels[:, p] (no windowing, no chunk_length, no shifting).
      
-        Stats computation
-        ------------------
-        The accuracy / token_stats / padding-analysis / perplexity / total_loss
-        bookkeeping produces bit-for-bit the same outputs as the original, but:
-          - top-1 predictions are computed once per micro-batch (via a single
-            torch.max call) instead of twice (once via argmax, once again inside
-            the accuracy block).
-          - per-token target/correct counts are computed with torch.bincount
-            instead of a Python loop over torch.unique(...) + per-token boolean
-            masking, which is the dominant cost when many distinct tokens appear
-            per micro-batch.
-          - softmax / top-5 / expected-label tensors are only computed when a
-            tokenizer is supplied (they're exclusively used for the debug dict),
-            instead of unconditionally every iteration.
-          - avg_nll is computed once instead of twice, and no tensor is mutated
-            in place after another view of it has already been used (the
-            original mutated `correct_tokens` in place after `flat_correct`,
-            a view of the same storage, had already been read elsewhere).
+        That means the entire per-token forward-pass loop from the windowed version
+        is unnecessary: there's nothing left to parallelize across calls, because
+        there's only one call. What's left is just vectorized bookkeeping (loss,
+        accuracy, token_stats, padding analysis, perplexity), computed once over
+        the full (B, seq_len, vocab) tensor instead of accumulated across many
+        micro-batches -- so all the per-iteration accumulator logic (total_loss +=,
+        total_nll_sum +=, target_counts_total +=, ...) collapses into single
+        (non-accumulating) computations.
      
-        This does NOT reduce total FLOPs of the forward passes themselves (each
-        window still reprocesses chunk_length tokens from scratch) -- it reduces
-        the number of separate forward() calls and removes redundant/unused
-        tensor math around them. Tune `window_batch_size` for your GPU memory
-        budget: larger = fewer calls = faster, until you run out of memory.
+        `starting_point` still lets you exclude the first N positions from the
+        loss/accuracy/perplexity computation (e.g. if the model's predictions are
+        unreliable before it has seen enough context), but no longer has anything
+        to do with a context-window size -- it's just an index offset now.
+     
+        -100 in labels still marks positions to exclude from every statistic,
+        exactly as before.
         """
      
-        starting_point = max(2, starting_point)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
      
         input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
      
-        chunk_length = self.memo.chunk_length
         vocab_size = self.config.vocab_size
         batch_size, seq_len = input_ids.shape
      
-        start = chunk_length + starting_point
-        if start >= seq_len:
+        if starting_point >= seq_len:
             return None, None, None
      
-        # ---- Build every sliding window up front -----------------------------------
-        # windows_all[:, j, :] == input_ids[:, j : j + chunk_length]
-        windows_all = input_ids.unfold(dimension=1, size=chunk_length, step=1)  # (B, W_total, chunk_length)
+        # ---- Single forward pass over the whole sequence ----------------------------
+        outputs = self.forward(
+            input_ids=input_ids,
+            labels=labels,
+            return_dict=return_dict,
+            compute_loss=True
+        )
+        logits = outputs.logits  # (B, seq_len, vocab_size)
+        lm_logits = logits.detach()
      
-        w_lo = starting_point           # j such that i = j + chunk_length == start
-        w_hi = seq_len - chunk_length   # j such that i = j + chunk_length == seq_len (exclusive upper bound)
-        windows = windows_all[:, w_lo:w_hi, :]                 # (B, num_windows, chunk_length)
+        if starting_point > 0:
+            lm_logits = lm_logits[:, starting_point:, :]
+            labels = labels[:, starting_point:]
      
-        label_lo = start - 1
-        label_hi = seq_len - 1
-        window_labels = labels[:, label_lo:label_hi]           # (B, num_windows), same as labels[:, i-1] for each i
+        # positions kept, expressed as indices into the *original* sequence -- used
+        # only for the 'sequence_index' field in the debug output.
+        kept_positions = list(range(starting_point, seq_len))
      
-        num_windows = window_labels.shape[1]
-        assert num_windows == windows.shape[1]
+        # top-k filtering (same as original): keep only the top-50 logits per position
+        top_k = torch.topk(lm_logits, k=50, dim=-1)
+        mask = torch.full_like(lm_logits, -12.0)
+        mask.scatter_(dim=-1, index=top_k.indices, src=top_k.values)
+        lm_logits = mask * 10
      
-        # original loop variable i, per window index j (0-based within `windows`)
-        window_i_values = list(range(start, seq_len))
+        _labels = labels.contiguous().to(self.memo.device)
+        loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=vocab_size)
      
-        total_loss = None
-        total_nll_sum = 0.0
-        num_tokens_predicted = 0
+        valid_mask = _labels != -100
+        flat_labels_t = _labels.flatten()
+        flat_valid = valid_mask.flatten()
      
-        tot_correct_tokens = None
-        total_tokens = None
+        num_valid_tokens = flat_valid.sum().item()
      
-        pad_token_id = getattr(self.config, 'pad_token_id', 0)
-        padding_token_analysis = {
-            'padding_tokens_masked': 0,
-            'padding_tokens_not_masked': 0,
-            'padding_tokens_correct': 0
-        }
+        total_loss = loss * num_valid_tokens
+        total_nll_sum = loss.detach() * num_valid_tokens
+        num_tokens_predicted = num_valid_tokens
      
-        # Vectorized per-token accumulators (replaces the Python-level token_stats dict
-        # that was updated with a torch.unique(...) loop every iteration).
-        if compute_accuracy:
-            target_counts_total = torch.zeros(vocab_size, dtype=torch.long, device=self.memo.device)
-            correct_counts_total = torch.zeros(vocab_size, dtype=torch.long, device=self.memo.device)
-     
-        debug_predictions = list()
         need_top1 = compute_accuracy or (tokenizer is not None)
+        if need_top1:
+            top1 = torch.max(lm_logits, dim=-1)
+            argmax = top1.indices          # (B, kept_len)
+            argmax_value = top1.values     # (B, kept_len)
+        else:
+            argmax = None
+            argmax_value = None
      
-        for w_start in range(0, num_windows, window_batch_size):
-            w_end = min(w_start + window_batch_size, num_windows)
-            w = w_end - w_start
-     
-            cur_windows = windows[:, w_start:w_end, :]     # (B, w, chunk_length)
-            cur_labels = window_labels[:, w_start:w_end]    # (B, w)
-     
-            # fold (batch, window) into one big batch dimension for a single forward() call
-            # NOTE: reshape order is row-major, so flat index = b * w + j -- kept consistent
-            # below whenever we need to regroup back to (batch, window).
-            flat_input_ids = cur_windows.reshape(batch_size * w, chunk_length)
-            flat_labels = cur_labels.reshape(batch_size * w, 1)
-     
-            outputs = self.forward(
-                input_ids=flat_input_ids,
-                labels=flat_labels,
-                return_dict=return_dict,
-                compute_loss=True
-            )
-            logits = outputs.logits
-            lm_logits = logits.detach()  # detach to prevent gradients flowing back through this copy
-     
-            # top-k filtering (same as original): keep only the top-50 logits per position
-            top_k = torch.topk(lm_logits, k=50, dim=-1)
-            mask = torch.full_like(lm_logits, -12.0)
-            mask.scatter_(dim=-1, index=top_k.indices, src=top_k.values)
-            lm_logits = mask * 10
-     
-            _labels = flat_labels.contiguous().to(self.memo.device)
-            loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=vocab_size)
-     
-            valid_mask = _labels != -100
-            flat_labels_t = _labels.flatten()
-            flat_valid = valid_mask.flatten()
-     
-            # single top-1 reduction, shared by the accuracy block and the debug block
-            # (previously computed twice: once via torch.argmax, once via torch.max)
-            if need_top1:
-                top1 = torch.max(lm_logits, dim=-1)
-                argmax = top1.indices
-                argmax_value = top1.values
-            else:
-                argmax = None
-                argmax_value = None
-     
-            if tokenizer is not None:
-                # Everything below is exclusively used to build the debug dict, so it's
-                # only computed when a tokenizer is actually supplied.
-                top_k5 = torch.topk(lm_logits, k=5, dim=-1)
-                _lm_logits_softmax = torch.nn.functional.softmax(lm_logits, dim=-1)
-                argmax_value_soft = torch.max(_lm_logits_softmax, dim=-1)
-                top_k_softmax = torch.topk(_lm_logits_softmax, k=5, dim=-1)
-     
-                expected_label_prob = torch.gather(_lm_logits_softmax, dim=-1, index=_labels.unsqueeze(-1)).squeeze(-1)
-                expected_label_score = torch.gather(lm_logits, dim=-1, index=_labels.unsqueeze(-1)).squeeze(-1)
-     
-                # Reshape everything back to (B, w, ...) so we can emit one debug dict
-                # per original position i, in the same shape the un-parallelized loop produced.
-                pred_tokens_flat = tokenizer.batch_decode(argmax)
-                expected_tokens_flat = tokenizer.batch_decode(_labels)
-                input_seq_flat = tokenizer.batch_decode(flat_input_ids, skip_special_tokens=True)
-     
-                def _regroup(flat_list):
-                    return [flat_list[b * w:(b + 1) * w] for b in range(batch_size)]
-     
-                pred_tokens_grouped = _regroup(pred_tokens_flat)
-                expected_tokens_grouped = _regroup(expected_tokens_flat)
-                input_seq_grouped = _regroup(input_seq_flat)
-     
-                pred_score = argmax_value.reshape(batch_size, w).cpu().numpy().tolist()
-                pred_score_softmax = argmax_value_soft.values.reshape(batch_size, w).cpu().numpy().tolist()
-                expected_label_prob_g = expected_label_prob.reshape(batch_size, w).cpu().numpy().tolist()
-                expected_label_score_g = expected_label_score.reshape(batch_size, w).cpu().numpy().tolist()
-                loss_scalar = loss.detach().cpu().numpy().tolist()  # mean loss over this whole micro-batch
-     
-                top_k_tokens_list = top_k5.indices.reshape(batch_size, w, -1).cpu().numpy().tolist()
-                top_k_scores = top_k5.values.reshape(batch_size, w, -1).cpu().numpy().tolist()
-                top_k_softmax_scores = top_k_softmax.values.reshape(batch_size, w, -1).cpu().numpy().tolist()
-     
-                lm_logits_r = lm_logits.reshape(batch_size, w, -1)
-                softmax_r = _lm_logits_softmax.reshape(batch_size, w, -1)
-                exp_r = torch.exp(lm_logits_r)
-     
-                vocab_sum = lm_logits_r.sum(dim=-1).cpu().numpy().tolist()
-                vocab_mean = lm_logits_r.mean(dim=-1).cpu().numpy().tolist()
-                vocab_sum_soft = softmax_r.sum(dim=-1).cpu().numpy().tolist()
-                vocab_mean_soft = softmax_r.mean(dim=-1).cpu().numpy().tolist()
-                vocab_min = lm_logits_r.min(dim=-1).values.cpu().numpy().tolist()
-                vocab_min_soft = softmax_r.min(dim=-1).values.cpu().numpy().tolist()
-     
-                exp_sum = exp_r.sum(dim=-1).cpu().numpy().tolist()
-                exp_mean = exp_r.mean(dim=-1).cpu().numpy().tolist()
-                exp_min = exp_r.min(dim=-1).values.cpu().numpy().tolist()
-                exp_max = exp_r.max(dim=-1).values.cpu().numpy().tolist()
-     
-                for local_j in range(w):
-                    i_value = window_i_values[w_start + local_j]
-                    batch_debug_info = {
-                        'sequence_index': i_value,
-                        'input_sequence': [input_seq_grouped[b][local_j] for b in range(batch_size)],
-                        'pred_tokens': [pred_tokens_grouped[b][local_j] for b in range(batch_size)],
-                        'pred_score': [pred_score[b][local_j] for b in range(batch_size)],
-                        'pred_score_softmax': [pred_score_softmax[b][local_j] for b in range(batch_size)],
-                        'expected_tokens': [expected_tokens_grouped[b][local_j] for b in range(batch_size)],
-                        'expected_label_prob': [expected_label_prob_g[b][local_j] for b in range(batch_size)],
-                        'expected_label_score': [expected_label_score_g[b][local_j] for b in range(batch_size)],
-                        'top_predicted_tokens': [
-                            tokenizer.convert_ids_to_tokens(top_k_tokens_list[b][local_j])
-                            for b in range(batch_size)
-                        ],
-                        'top_predicted_token_scores': [top_k_scores[b][local_j] for b in range(batch_size)],
-                        'top_predicted_tokens_softmax': [top_k_softmax_scores[b][local_j] for b in range(batch_size)],
-     
-                        'vocab_distribution_score_sum': [vocab_sum[b][local_j] for b in range(batch_size)],
-                        'vocab_distribution_score_mean': [vocab_mean[b][local_j] for b in range(batch_size)],
-                        'vocab_distribution_score_sum_softmax': [vocab_sum_soft[b][local_j] for b in range(batch_size)],
-                        'vocab_distribution_score_mean_softmax': [vocab_mean_soft[b][local_j] for b in range(batch_size)],
-                        'vocab_distrib_min_score': [vocab_min[b][local_j] for b in range(batch_size)],
-                        'vocab_distrib_min_score_softmax': [vocab_min_soft[b][local_j] for b in range(batch_size)],
-     
-                        'exp_vocab_distribution_score_sum': [exp_sum[b][local_j] for b in range(batch_size)],
-                        'exp_vocab_distribution_score_mean': [exp_mean[b][local_j] for b in range(batch_size)],
-                        'exp_vocab_distrib_min_score': [exp_min[b][local_j] for b in range(batch_size)],
-                        'exp_vocab_distrib_max_score': [exp_max[b][local_j] for b in range(batch_size)],
-     
-                        # NOTE: unlike the original (which had a true per-position loss),
-                        # this is the mean loss over the whole window_batch_size micro-batch,
-                        # since loss is now computed once per group rather than once per position.
-                        'loss': loss_scalar,
-                    }
-                    for key, value in batch_debug_info.items():
-                        if isinstance(value, list):
-                            if len(value) > 0 and isinstance(value[0], list):
-                                batch_debug_info[key] = [[str(v) if str(v) in ['inf', '-inf'] else v for v in sublist] for sublist in value]
-                            else:
-                                batch_debug_info[key] = [str(v) if str(v) in ['inf', '-inf'] else v for v in value]
-                        elif isinstance(value, float) and (str(value) in ['inf', '-inf']):
-                            batch_debug_info[key] = str(value)
-                    debug_predictions.append(batch_debug_info)
-     
-            num_valid_tokens_in_batch = flat_valid.sum().item()
-     
-            if total_loss is None:
-                total_loss = loss * num_valid_tokens_in_batch
-            else:
-                total_loss += loss * num_valid_tokens_in_batch
-     
-            total_nll_sum += loss.detach() * num_valid_tokens_in_batch
-            num_tokens_predicted += num_valid_tokens_in_batch
-     
-            if compute_accuracy:
-                flat_correct = (argmax == _labels).flatten()  # bool, same shape as flat_labels_t
-     
-                valid_labels = flat_labels_t[flat_valid]
-                valid_correct = flat_correct[flat_valid]
-     
-                # per-token target/correct counts, vectorized (replaces the
-                # torch.unique(...) + per-token masking Python loop)
-                target_counts_total += torch.bincount(valid_labels, minlength=vocab_size)
-                correct_counts_total += torch.bincount(valid_labels[valid_correct], minlength=vocab_size)
-     
-                # padding analysis
-                is_pad = flat_labels_t == pad_token_id
-                masked_padding = torch.sum(is_pad & ~flat_valid).item()
-                not_masked_padding = torch.sum(is_pad & flat_valid).item()
-                padding_token_analysis['padding_tokens_masked'] += masked_padding
-                padding_token_analysis['padding_tokens_not_masked'] += not_masked_padding
-                if not_masked_padding > 0:
-                    padding_token_analysis['padding_tokens_correct'] += torch.sum(flat_correct & is_pad & flat_valid).item()
-     
-                correct_incr = valid_correct.sum()
-                tot_correct_tokens = correct_incr if tot_correct_tokens is None else tot_correct_tokens + correct_incr
-     
-                tokens_incr = flat_valid.sum()
-                total_tokens = tokens_incr if total_tokens is None else total_tokens + tokens_incr
-     
-            del outputs, logits, lm_logits, flat_input_ids, flat_labels, _labels
-            torch.cuda.empty_cache()
-     
+        # ---- Accuracy / token_stats / padding analysis, vectorized, one shot -------
+        accuracy_results = None
         if compute_accuracy:
-            nonzero_ids = torch.nonzero(target_counts_total, as_tuple=True)[0].tolist()
+            flat_correct = (argmax == _labels).flatten()  # bool
+     
+            valid_labels = flat_labels_t[flat_valid]
+            valid_correct = flat_correct[flat_valid]
+     
+            target_counts = torch.bincount(valid_labels, minlength=vocab_size)
+            correct_counts = torch.bincount(valid_labels[valid_correct], minlength=vocab_size)
+            nonzero_ids = torch.nonzero(target_counts, as_tuple=True)[0].tolist()
             token_stats = {
                 tid: {
-                    'target_count': target_counts_total[tid].item(),
-                    'correct_count': correct_counts_total[tid].item(),
+                    'target_count': target_counts[tid].item(),
+                    'correct_count': correct_counts[tid].item(),
                 }
                 for tid in nonzero_ids
             }
-            accuracy_results = dict(
-                accuracy=(tot_correct_tokens / total_tokens).detach().cpu().item(),
-                correct_tokens=tot_correct_tokens.detach().cpu().item(),
-                tot_tokens=total_tokens.detach().cpu().item(),
-                token_stats=token_stats,
-                padding_analysis=padding_token_analysis['padding_tokens_correct'],
-            )
-        else:
-            accuracy_results = None
      
+            pad_token_id = getattr(self.config, 'pad_token_id', 0)
+            is_pad = flat_labels_t == pad_token_id
+            padding_tokens_masked = torch.sum(is_pad & ~flat_valid).item()
+            padding_tokens_not_masked = torch.sum(is_pad & flat_valid).item()
+            padding_tokens_correct = (
+                torch.sum(flat_correct & is_pad & flat_valid).item()
+                if padding_tokens_not_masked > 0 else 0
+            )
+     
+            tot_correct_tokens = valid_correct.sum().item()
+            tot_tokens = int(num_valid_tokens)
+     
+            accuracy_results = dict(
+                accuracy=(tot_correct_tokens / tot_tokens) if tot_tokens > 0 else 0.0,
+                correct_tokens=tot_correct_tokens,
+                tot_tokens=tot_tokens,
+                token_stats=token_stats,
+                padding_analysis=padding_tokens_correct,
+            )
+            # kept for parity with the original dict shape, in case callers read these:
+            accuracy_results['padding_tokens_masked'] = padding_tokens_masked
+            accuracy_results['padding_tokens_not_masked'] = padding_tokens_not_masked
+     
+        # ---- Perplexity ---------------------------------------------------------------
         if num_tokens_predicted > 0:
             avg_nll_tensor = total_nll_sum / num_tokens_predicted
             avg_nll_value = avg_nll_tensor.detach().cpu().item()
@@ -1780,6 +1624,108 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         accuracy_results['perplexity'] = perplexity_value
         accuracy_results['avg_nll'] = avg_nll_value
         accuracy_results['num_tokens'] = num_tokens_predicted
+     
+        # ---- Optional debug info (only built if a tokenizer is supplied) --------------
+        debug_predictions = list()
+        if tokenizer is not None:
+            top_k5 = torch.topk(lm_logits, k=5, dim=-1)
+            _lm_logits_softmax = torch.nn.functional.softmax(lm_logits, dim=-1)
+            argmax_value_soft = torch.max(_lm_logits_softmax, dim=-1)
+            top_k_softmax = torch.topk(_lm_logits_softmax, k=5, dim=-1)
+     
+            # _labels contains -100 at masked positions, which is not a valid vocab
+            # index / token id -- gather() and tokenizer decoding both require real
+            # ids. Build a clamped copy for indexing/decoding only; the *_prob /
+            # *_score / *_tokens values at masked positions are meaningless
+            # placeholders and should be ignored there (valid_mask / flat_valid
+            # already tells you which positions are real).
+            pad_token_id_for_decode = getattr(self.config, 'pad_token_id', 0) or 0
+            safe_labels = torch.where(
+                _labels == -100,
+                torch.full_like(_labels, pad_token_id_for_decode),
+                _labels
+            )
+     
+            expected_label_prob = torch.gather(_lm_logits_softmax, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+            expected_label_score = torch.gather(lm_logits, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+     
+            pred_tokens_flat = tokenizer.batch_decode(argmax.reshape(-1, 1))
+            expected_tokens_flat = tokenizer.batch_decode(safe_labels.reshape(-1, 1))
+     
+            kept_len = lm_logits.shape[1]
+     
+            def _regroup(flat_list):
+                return [flat_list[b * kept_len:(b + 1) * kept_len] for b in range(batch_size)]
+     
+            pred_tokens_grouped = _regroup(pred_tokens_flat)
+            expected_tokens_grouped = _regroup(expected_tokens_flat)
+     
+            pred_score = argmax_value.cpu().numpy().tolist()
+            pred_score_softmax = argmax_value_soft.values.cpu().numpy().tolist()
+            expected_label_prob_l = expected_label_prob.cpu().numpy().tolist()
+            expected_label_score_l = expected_label_score.cpu().numpy().tolist()
+     
+            top_k_tokens_list = top_k5.indices.cpu().numpy().tolist()
+            top_k_scores = top_k5.values.cpu().numpy().tolist()
+            top_k_softmax_scores = top_k_softmax.values.cpu().numpy().tolist()
+     
+            vocab_sum = lm_logits.sum(dim=-1).cpu().numpy().tolist()
+            vocab_mean = lm_logits.mean(dim=-1).cpu().numpy().tolist()
+            vocab_sum_soft = _lm_logits_softmax.sum(dim=-1).cpu().numpy().tolist()
+            vocab_mean_soft = _lm_logits_softmax.mean(dim=-1).cpu().numpy().tolist()
+            vocab_min = lm_logits.min(dim=-1).values.cpu().numpy().tolist()
+            vocab_min_soft = _lm_logits_softmax.min(dim=-1).values.cpu().numpy().tolist()
+     
+            exp_lm_logits = torch.exp(lm_logits)
+            exp_sum = exp_lm_logits.sum(dim=-1).cpu().numpy().tolist()
+            exp_mean = exp_lm_logits.mean(dim=-1).cpu().numpy().tolist()
+            exp_min = exp_lm_logits.min(dim=-1).values.cpu().numpy().tolist()
+            exp_max = exp_lm_logits.max(dim=-1).values.cpu().numpy().tolist()
+     
+            loss_scalar = loss.detach().cpu().numpy().tolist()  # mean loss over the whole sequence/batch
+     
+            for local_p in range(kept_len):
+                i_value = kept_positions[local_p]
+                batch_debug_info = {
+                    'sequence_index': i_value,
+                    'pred_tokens': [pred_tokens_grouped[b][local_p] for b in range(batch_size)],
+                    'pred_score': [pred_score[b][local_p] for b in range(batch_size)],
+                    'pred_score_softmax': [pred_score_softmax[b][local_p] for b in range(batch_size)],
+                    'expected_tokens': [expected_tokens_grouped[b][local_p] for b in range(batch_size)],
+                    'expected_label_prob': [expected_label_prob_l[b][local_p] for b in range(batch_size)],
+                    'expected_label_score': [expected_label_score_l[b][local_p] for b in range(batch_size)],
+                    'top_predicted_tokens': [
+                        tokenizer.convert_ids_to_tokens(top_k_tokens_list[b][local_p])
+                        for b in range(batch_size)
+                    ],
+                    'top_predicted_token_scores': [top_k_scores[b][local_p] for b in range(batch_size)],
+                    'top_predicted_tokens_softmax': [top_k_softmax_scores[b][local_p] for b in range(batch_size)],
+     
+                    'vocab_distribution_score_sum': [vocab_sum[b][local_p] for b in range(batch_size)],
+                    'vocab_distribution_score_mean': [vocab_mean[b][local_p] for b in range(batch_size)],
+                    'vocab_distribution_score_sum_softmax': [vocab_sum_soft[b][local_p] for b in range(batch_size)],
+                    'vocab_distribution_score_mean_softmax': [vocab_mean_soft[b][local_p] for b in range(batch_size)],
+                    'vocab_distrib_min_score': [vocab_min[b][local_p] for b in range(batch_size)],
+                    'vocab_distrib_min_score_softmax': [vocab_min_soft[b][local_p] for b in range(batch_size)],
+     
+                    'exp_vocab_distribution_score_sum': [exp_sum[b][local_p] for b in range(batch_size)],
+                    'exp_vocab_distribution_score_mean': [exp_mean[b][local_p] for b in range(batch_size)],
+                    'exp_vocab_distrib_min_score': [exp_min[b][local_p] for b in range(batch_size)],
+                    'exp_vocab_distrib_max_score': [exp_max[b][local_p] for b in range(batch_size)],
+     
+                    # NOTE: single scalar mean loss over the whole batch/sequence, not per-position
+                    # (same caveat as the windowed version -- there's now only one loss value total).
+                    'loss': loss_scalar,
+                }
+                for key, value in batch_debug_info.items():
+                    if isinstance(value, list):
+                        if len(value) > 0 and isinstance(value[0], list):
+                            batch_debug_info[key] = [[str(v) if str(v) in ['inf', '-inf'] else v for v in sublist] for sublist in value]
+                        else:
+                            batch_debug_info[key] = [str(v) if str(v) in ['inf', '-inf'] else v for v in value]
+                    elif isinstance(value, float) and (str(value) in ['inf', '-inf']):
+                        batch_debug_info[key] = str(value)
+                debug_predictions.append(batch_debug_info)
      
         batch_debug = dict(
             ppl=accuracy_results['perplexity'],

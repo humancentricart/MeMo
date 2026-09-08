@@ -439,7 +439,10 @@ class MeMoLayer(Module):
         if self.use_local_CMM  and self.compositionOp == CompositionOp.JLT:
             retrieved_sequence_encoding = self.CMM(seq_enc_per_token)
 
-
+        # pad, pad, pad 1 --> 2
+        # pad, pad, 1, 2 --> 3
+        # ...
+        # 1, 2, 3, 4 --> 4
         # ESR 2026-09-08
         # if self.layerized_CMM_OUT:
         #     layered_out_token = self.CMM_OUT(seq_enc_per_token[:,-1,:])
@@ -449,9 +452,9 @@ class MeMoLayer(Module):
         #     layered_out_token = None
         if self.layerized_CMM_OUT:
             if DEBUGGING:
-                print("sequence_encoding.shape", sequence_encoding.shape)
+                print("sequence_encoding.shape", sequence_encoding.shape) #1 16 2048
                 print(self.CMM_OUT)
-            layered_out_token = self.CMM_OUT(sequence_encoding[:,-1,:])
+            layered_out_token = self.CMM_OUT(sequence_encoding)#[:,-1,:])
             if DEBUGGING:
                 print("layered_out_token.shape", layered_out_token.shape)
             

@@ -216,7 +216,8 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
             if non_zero_mask is not None:
                 batch_input_ids[k] = batch_input_ids[k][non_zero_mask]
 
-        batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=max_length+longest_length)
+        ##### ESR 2029-09-08 # removed to pair it with forward_with_loss_simple
+        #batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=max_length+longest_length)
 
         memo_input = self.get_memo_input(batch_input_ids)
         batch_encoding = memo_input
