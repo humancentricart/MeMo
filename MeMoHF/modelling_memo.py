@@ -265,8 +265,8 @@ class MeMo(MeMoPreTrainedModel):
 
         # Everything before the sequence becomes PAD = -1
         whento = whento.clamp(min=-1)
-        if DEBUGGING:
-            print("whento (selected indexes for layer ", layer, "):", whento)
+        #if DEBUGGING:
+        #    print("whento (selected indexes for layer ", layer, "):", whento)
 
         # Keep track of padding positions
         valid = whento != -1
@@ -400,34 +400,34 @@ class MeMo(MeMoPreTrainedModel):
                       memo_input['labels'].to(self.device))
         
     
-    def forget(self, input_sequence_ids, labels_ids, completely=True):
-        input_sequence = self.encoder.encode(input_sequence_ids)
-        output_symbols = self.output_encoder.encode(labels_ids) #### FMZ 2026-07-01
+    # def forget(self, input_sequence_ids, labels_ids, completely=True):
+    #     input_sequence = self.encoder.encode(input_sequence_ids)
+    #     output_symbols = self.output_encoder.encode(labels_ids) #### FMZ 2026-07-01
 
-        (batch_size, current_length, d) = input_sequence.shape
-        #assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
+    #     (batch_size, current_length, d) = input_sequence.shape
+    #     #assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
         
-        last_layer = self.layers[self.l-1]
+    #     last_layer = self.layers[self.l-1]
         
         
-        for layer_level in range(self.l):
-            input_sequence = self.generate_sequences(input_seqs=input_sequence, layer=layer_level)
-            ## TODO how to debug now? 
-            input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].forget(input_sequence, 
-                                                                                                output_symbols, 
-                                                                                                completely=completely,
-                                                                                                is_last= (layer_level == self.l-1) )
+    #     for layer_level in range(self.l):
+    #         input_sequence = self.generate_sequences(input_seqs=input_sequence, layer=layer_level)
+    #         ## TODO how to debug now? 
+    #         input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].forget(input_sequence, 
+    #                                                                                             output_symbols, 
+    #                                                                                             completely=completely,
+    #                                                                                             is_last= (layer_level == self.l-1) )
             
-            last_layer.directly_forget(seq_encoding_for_the_last_layer)
+    #         last_layer.directly_forget(seq_encoding_for_the_last_layer)
             
         
         
     
-    def forget_text(self, memo_input, completely=True):
-        #for i in range(0,self.h):
-        self.forget(memo_input['input_ids'].to(self.device),
-                    memo_input['labels'].to(self.device), 
-                    completely=completely)
+    # def forget_text(self, memo_input, completely=True):
+    #     #for i in range(0,self.h):
+    #     self.forget(memo_input['input_ids'].to(self.device),
+    #                 memo_input['labels'].to(self.device), 
+    #                 completely=completely)
 
     
     def retrieve(self,
@@ -553,7 +553,13 @@ class MeMo(MeMoPreTrainedModel):
             )
             
             sequence_representation, seq_encoding_for_the_last_layer = outputs['sequence_encoding'], outputs['token_encoding']
-            encoding_for_the_last_layer += seq_encoding_for_the_last_layer
+            #print("sequence_representation.shape", sequence_representation.shape)
+            #print("outputs['layered_out_token'].shape", outputs['layered_out_token'].shape)
+            #print(self.output_encoder.decode(outputs['layered_out_token']))
+            #print("residual_stream.shape", residual_stream.shape)
+            ### ESR 2026-09-08 this is the direct way to avoid errors, but with compOp == prod I lost track of what it is supposed to be
+            if seq_encoding_for_the_last_layer is not None:
+                encoding_for_the_last_layer += seq_encoding_for_the_last_layer
             
             # This is to capture the layer by layer extraction of the next token: the output of each layer is normalized in order to 
             # penalize short sequences 
@@ -616,18 +622,18 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
 
         
 
-    def forget_text(self, memo_input, completely=True):
-        return self.memo.forget_text(
-            memo_input=memo_input,
-            completely=completely
-        )
+    # def forget_text(self, memo_input, completely=True):
+    #     return self.memo.forget_text(
+    #         memo_input=memo_input,
+    #         completely=completely
+    #     )
     
-    def forget(self, input_ids, labels_ids, completely=True):
-        return self.memo.forget(
-            input_ids=input_ids,    
-            labels_ids=labels_ids,
-            completely=completely
-        )
+    # def forget(self, input_ids, labels_ids, completely=True):
+    #     return self.memo.forget(
+    #         input_ids=input_ids,    
+    #         labels_ids=labels_ids,
+    #         completely=completely
+    #     )
 
         
     def memorize_text(self, memo_input):
