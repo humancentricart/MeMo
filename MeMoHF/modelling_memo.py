@@ -77,6 +77,8 @@ class MeMoModelOutputWithPast(ModelOutput):
     """
 
     last_token_representation: torch.FloatTensor = None
+    #ESR 2026-09-16
+    residual_stream_unpacked: torch.FloatTensor = None
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     hidden_tokens: Optional[Tuple[torch.FloatTensor, ...]] = None
@@ -490,7 +492,7 @@ class MeMo(MeMoPreTrainedModel):
         
         if self.layerized_CMM_OUT: 
             residual_stream = torch.zeros((batch_size, self.chunk_length, self.d)).to(self.device)
-
+            residual_stream_unpacked = torch.zeros((self.l, batch_size, self.chunk_length, self.d)).to(self.device)
         
         # moved outside the logic for tokenization, here only assertiion above
         #if len(input_sequence) > current_length:
@@ -573,7 +575,7 @@ class MeMo(MeMoPreTrainedModel):
                     p=2,
                     dim=1
                 )
-            
+                residual_stream_unpacked[layer_level] = outputs['layered_out_token']
 
 
         # Add last hidden state
@@ -600,6 +602,7 @@ class MeMo(MeMoPreTrainedModel):
         
         return MeMoModelOutputWithPast(
             last_token_representation=last_token_representation,
+            residual_stream_unpacked=residual_stream_unpacked,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             hidden_tokens=all_hidden_tokens,
@@ -664,7 +667,8 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        compute_loss: Optional[bool] = False):
+        compute_loss: Optional[bool] = False
+    ):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
@@ -683,18 +687,40 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             cache_position=cache_position
         )
 
-        last_token_representation = outputs['last_token_representation']
-        
+        last_token_representation = outputs['residual_stream_unpacked']   # 
+        ## ESR 2026-09-16
+        #print("last_token_representation.shape", last_token_representation.shape)
         #the greedy decode step
         #retrieved_output_symbol_vector, score_max = self.lm_head.decode(last_token_representation)
         #return retrieved_output_symbol_vector, score_max
     
         lm_logits = self.lm_head.lm_logits(last_token_representation)
+        ## ESR 2026-09-16
+        #print("lm_logits.shape", lm_logits.shape)
+
+
+        num_layers = self.memo.l
+        decay = self.memo.lambda_val
+        
+        weights = decay ** torch.arange(
+            num_layers - 1, -1, -1,
+            device=lm_logits.device
+        )
+        ## ESR 2026-09-16
+        #print(weights)
+        # [num_layers] -> [num_layers, 1, 1, 1]
+        weights = weights.view(num_layers, 1, 1, 1)
+        
+        lm_logits = (lm_logits * weights).sum(dim=0) / weights.sum()
+        
+        ## ESR 2026-09-16
+        #print("lm_logits.shape", lm_logits.shape)
+        
         loss = None # TODO: compute the loss function
         # if labels is not None:
         #     # default loss: transformers.loss.loss_utility.ForCausalLMLoss
         #     loss = self.loss_function(logits=lm_logits, labels=labels[:, -1:], vocab_size=self.config.vocab_size)#, **kwargs)
-
+    
             
         
         if not return_dict:
@@ -1481,7 +1507,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         batch_inputs,
         return_dict: Optional[bool] = None,
         compute_accuracy=False,
-        starting_point=0,
+        starting_point=9,
         tokenizer=None,
     ) -> Optional[Union[Tuple[torch.Tensor], "MeMoCausalLMOutputWithPast"]]:
         """
@@ -1511,7 +1537,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         -100 in labels still marks positions to exclude from every statistic,
         exactly as before.
         """
-     
+        starting_point = max(2, starting_point)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
      
         input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
@@ -1746,83 +1772,83 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         ), accuracy_results, batch_debug
 
     
-    def forward_with_loss_parallelized(
-        self,
-        batch_inputs,
-        return_dict: Optional[bool] = None,
-        compute_accuracy=False,
-        # tokenizer = None
-        # pad_token_id=0
-    ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
+    # def forward_with_loss_parallelized(
+    #     self,
+    #     batch_inputs,
+    #     return_dict: Optional[bool] = None,
+    #     compute_accuracy=False,
+    #     # tokenizer = None
+    #     # pad_token_id=0
+    # ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
 
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+    #     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # batch_encoding = tokenizer.get_text_batch_encoding_for_loss(text=text_batch)
-        input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
+    #     # batch_encoding = tokenizer.get_text_batch_encoding_for_loss(text=text_batch)
+    #     input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
 
-        logits_list = list()
-        outputs = None 
-        lm_logits = None
-        # for i in range(self.memo.chunk_length, labels.shape[1]):
+    #     logits_list = list()
+    #     outputs = None 
+    #     lm_logits = None
+    #     # for i in range(self.memo.chunk_length, labels.shape[1]):
         
-        source_ids = windowed_sequence(
-            tensor_ids=input_ids,
-            window_size=self.memo.chunk_length,
-            # hidden_dim=self.memo.config.hi
-        )
-        # target_ids = windowed_sequence(
-        #     tensor_ids=labels[:, -self.memo.chunk_length:],
-        #     window_size=1
-        # )
+    #     source_ids = windowed_sequence(
+    #         tensor_ids=input_ids,
+    #         window_size=self.memo.chunk_length,
+    #         # hidden_dim=self.memo.config.hi
+    #     )
+    #     # target_ids = windowed_sequence(
+    #     #     tensor_ids=labels[:, -self.memo.chunk_length:],
+    #     #     window_size=1
+    #     # )
 
-        outputs = self.forward(
-            input_ids=source_ids,
-            # labels=target_ids,
-            return_dict=return_dict,
-            compute_loss=True
-        )
+    #     outputs = self.forward(
+    #         input_ids=source_ids,
+    #         # labels=target_ids,
+    #         return_dict=return_dict,
+    #         compute_loss=True
+    #     )
 
-        logits = outputs.logits 
-        lm_logits = restore_windowed_sequence_outputs(
-            output_ids=logits,
-            batch_size=input_ids.shape[0],
-            hidden_dim=self.config.vocab_size
-        )
-            # logits_list.append(logits)
+    #     logits = outputs.logits 
+    #     lm_logits = restore_windowed_sequence_outputs(
+    #         output_ids=logits,
+    #         batch_size=input_ids.shape[0],
+    #         hidden_dim=self.config.vocab_size
+    #     )
+    #         # logits_list.append(logits)
         
-        # lm_logits = torch.cat(logits_list, dim=1)
-        _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)#labels
-        # _labels[_labels == pad_token_id] = -100 # TODO: manage situations in which EOS is 0; replace 0 with tokenizer.pad_token_id
-        loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
-        # pred = torch.max(lm_logits, dim=-1)
-        # p_indices, p_values = pred.indices, pred.values
-        accuracy_results = None
-        if compute_accuracy:
-            # argmax for selecting most probable labels
-            pred = torch.max(lm_logits, dim=-1)
-            p_indices, p_values = pred.indices, pred.values
-            # create bitmask for correctly predicted labels
-            correct_tokens = (p_indices == _labels).type(torch.int)
-            # set bitmask entries to 0 for -100 tokens
-            correct_tokens[_labels == -100] = 0
-            correct_tokens = torch.sum(correct_tokens)
-            # count how many tokens != -100 in labels
-            tot_tokens = torch.sum((_labels != -100).type(torch.int))
-            # compute accuracy, and return dictionary with these fields
-            accuracy_results = dict(
-                accuracy=(correct_tokens/tot_tokens).detach().cpu().item(),
-                correct_tokens=correct_tokens.detach().cpu().item(),
-                tot_tokens=tot_tokens.detach().cpu().item()
-            )
+    #     # lm_logits = torch.cat(logits_list, dim=1)
+    #     _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)#labels
+    #     # _labels[_labels == pad_token_id] = -100 # TODO: manage situations in which EOS is 0; replace 0 with tokenizer.pad_token_id
+    #     loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
+    #     # pred = torch.max(lm_logits, dim=-1)
+    #     # p_indices, p_values = pred.indices, pred.values
+    #     accuracy_results = None
+    #     if compute_accuracy:
+    #         # argmax for selecting most probable labels
+    #         pred = torch.max(lm_logits, dim=-1)
+    #         p_indices, p_values = pred.indices, pred.values
+    #         # create bitmask for correctly predicted labels
+    #         correct_tokens = (p_indices == _labels).type(torch.int)
+    #         # set bitmask entries to 0 for -100 tokens
+    #         correct_tokens[_labels == -100] = 0
+    #         correct_tokens = torch.sum(correct_tokens)
+    #         # count how many tokens != -100 in labels
+    #         tot_tokens = torch.sum((_labels != -100).type(torch.int))
+    #         # compute accuracy, and return dictionary with these fields
+    #         accuracy_results = dict(
+    #             accuracy=(correct_tokens/tot_tokens).detach().cpu().item(),
+    #             correct_tokens=correct_tokens.detach().cpu().item(),
+    #             tot_tokens=tot_tokens.detach().cpu().item()
+    #         )
 
 
 
 
-        return MeMoCausalLMOutputWithPast(
-            loss=loss,
-            logits=lm_logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            hidden_tokens=outputs.hidden_tokens,
-        ), accuracy_results
+    #     return MeMoCausalLMOutputWithPast(
+    #         loss=loss,
+    #         logits=lm_logits,
+    #         past_key_values=outputs.past_key_values,
+    #         hidden_states=outputs.hidden_states,
+    #         hidden_tokens=outputs.hidden_tokens,
+    #     ), accuracy_results
 

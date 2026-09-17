@@ -127,6 +127,8 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches, trai
     model.train()
     model.to('cuda')
 
+    print(model)
+
     print("Tokenizer", tokenizer.pad_token_id, tokenizer.vocab_size)
     print("Model", model.memo.encoder.padding_idx, model.memo.encoder.padding_seq_idx, model.memo.encoder.num_embeddings)
     print("Model", model.memo.output_encoder.padding_idx, model.memo.output_encoder.padding_seq_idx, model.memo.output_encoder.num_embeddings)
@@ -138,7 +140,10 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches, trai
     idx = 0
     for batch_examples in tqdm(data_iter):
         data_batch = tokenizer.get_text_batch_encoding(batch_examples['text'])
-        
+        #print("data_batch")
+        #print(data_batch['input_ids'].shape)
+        if idx == 0:
+            print(data_batch['input_ids'])
         model.memorize_text(data_batch)
         idx += 1
         if save_every_k_batches > 0 and idx % save_every_k_batches == 0:
@@ -193,7 +198,9 @@ def compute_ppl(model, tokenizer, device, data_iter, max_token_distrib_rank=10):
     
     for batch_examples in tqdm(data_iter):
         batch_inputs = tokenizer.get_text_batch_encoding_for_loss(text=batch_examples['text'])
-
+        #print("batch_inputs")
+        #print(batch_inputs['input_ids'].shape)
+        #print(batch_inputs['input_ids'])
         with torch.no_grad():
             outputs, accuracy, batch_debug_info = model.forward_with_loss_simple( #unfold
                 batch_inputs=batch_inputs,
@@ -503,7 +510,7 @@ memo_configs = [
     # dict(max_length=1024, d=1024, l=4, h=4),
     # dict(max_length=4096, d=16384, l=6, h=4, alpha_gen=1, compositionOp='prod'),
     # dict(max_length=4096, d=8192, l=6, h=4, alpha_gen=1, compositionOp='prod'),
-    dict(max_length=h ** l, d=4096, l=l, h=h, alpha_gen=1, compositionOp='prod', padding_vector_component_values=1/(4096**(1/2)) )#),
+    dict(max_length=h ** l, d=4096, l=l, h=h, alpha_gen=1, compositionOp='JLT', padding_vector_component_values=0)#compositionOp='prod', padding_vector_component_values=1/(4096**(1/2)) )#),
     #dict(max_length=4096, d=2048, l=6, h=4, alpha_gen=1, compositionOp='prod'),
     #dict(max_length=4096, d=4096, l=6, h=4, alpha_gen=1, compositionOp='Sum'),
 ]
@@ -512,20 +519,20 @@ memo_configs = [
 import argparse
 
 parser = argparse.ArgumentParser() 
-parser.add_argument('--data_dir', default='original_training_data/new_sample/mini') #samples')
+parser.add_argument('--data_dir', default='original_training_data/new_sample/pile_mini')#mini') #samples') 
 # parser.add_argument('--data_dir', default='training_data/new_sample/scaling') #samples')
 # parser.add_argument('--models_dir', default='models_scale_1k')
 parser.add_argument('--train_custom_tokenizer', default=False)
-parser.add_argument('--models_dir', default='models_scale_pad_testing_6_prodcorrect6_1d')
+parser.add_argument('--models_dir', default='models_pile_mini_6_JLT6_resu_1d')
 parser.add_argument('--seeds', default=[42])
 parser.add_argument('--batch_size', default=2)
 parser.add_argument('--eval_batch_size', default=2)
 # parser.add_argument('--train_csv', default='memo_trained_scale_1k.csv')
 # parser.add_argument('--eval_csv', default='memo_ppl_train_eval_scale_1k.csv')
 # parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval_scale_1k.csv')
-parser.add_argument('--train_csv', default='memo_trained_scale_pad_testing_6_prodcorrect6_1d.csv')
-parser.add_argument('--eval_csv', default='memo_ppl_train_eval_scale_pad_testing_6_prodcorrect6_1d.csv')
-parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval_scale_pad_testing_6_prodcorrect6_1d.csv')
+parser.add_argument('--train_csv', default='memo_trained_pile_mini_6_JLT6_resu_1d.csv')
+parser.add_argument('--eval_csv', default='memo_ppl_train_eval_pile_mini_6_JLT6_resu_1d.csv')
+parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval_pile_mini_6_JLT6_resu_1d.csv')
 # parser.add_argument('--')
 
 

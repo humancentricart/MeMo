@@ -278,7 +278,7 @@ class MeMoEmbedding(Embedding):
     
     ### usage as unembedding matrix, used in CausaLMHead 
     def lm_logits(self, input_embeddings):
-        if len(input_embeddings.shape) != 3:
+        if len(input_embeddings.shape) < 3:
             input_embeddings = torch.unsqueeze(input_embeddings, dim=1) #add a dimension for seq_len for compatibility reasons
         logits = torch.matmul(input_embeddings, self.weight.T)
         return logits 
