@@ -510,7 +510,7 @@ memo_configs = [
     # dict(max_length=1024, d=1024, l=4, h=4),
     # dict(max_length=4096, d=16384, l=6, h=4, alpha_gen=1, compositionOp='prod'),
     # dict(max_length=4096, d=8192, l=6, h=4, alpha_gen=1, compositionOp='prod'),
-    dict(max_length=h ** l, d=4096, l=l, h=h, alpha_gen=1, compositionOp='JLT', padding_vector_component_values=0)#compositionOp='prod', padding_vector_component_values=1/(4096**(1/2)) )#),
+    dict(max_length=h ** l, d=4096, l=l, h=h, alpha_gen=1, compositionOp='prod', padding_vector_component_values=1/(4096**(1/2)) )#compositionOp='JLT', padding_vector_component_values=0)#
     #dict(max_length=4096, d=2048, l=6, h=4, alpha_gen=1, compositionOp='prod'),
     #dict(max_length=4096, d=4096, l=6, h=4, alpha_gen=1, compositionOp='Sum'),
 ]
@@ -523,16 +523,16 @@ parser.add_argument('--data_dir', default='original_training_data/new_sample/pil
 # parser.add_argument('--data_dir', default='training_data/new_sample/scaling') #samples')
 # parser.add_argument('--models_dir', default='models_scale_1k')
 parser.add_argument('--train_custom_tokenizer', default=False)
-parser.add_argument('--models_dir', default='models_pile_mini_6_JLT6_resu_1d')
+parser.add_argument('--models_dir', default='models_pile_mini_6_prod6_select1_resu_1d')
 parser.add_argument('--seeds', default=[42])
 parser.add_argument('--batch_size', default=2)
 parser.add_argument('--eval_batch_size', default=2)
 # parser.add_argument('--train_csv', default='memo_trained_scale_1k.csv')
 # parser.add_argument('--eval_csv', default='memo_ppl_train_eval_scale_1k.csv')
 # parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval_scale_1k.csv')
-parser.add_argument('--train_csv', default='memo_trained_pile_mini_6_JLT6_resu_1d.csv')
-parser.add_argument('--eval_csv', default='memo_ppl_train_eval_pile_mini_6_JLT6_resu_1d.csv')
-parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval_pile_mini_6_JLT6_resu_1d.csv')
+parser.add_argument('--train_csv', default='memo_trained_pile_mini_6_prod6_select1_resu_1d.csv')
+parser.add_argument('--eval_csv', default='memo_ppl_train_eval_pile_mini_6_prod6_select1_resu_1d.csv')
+parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval_pile_mini_6_prod6_select1_resu_1d.csv')
 # parser.add_argument('--')
 
 

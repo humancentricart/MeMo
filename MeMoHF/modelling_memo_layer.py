@@ -224,7 +224,7 @@ class MeMoLayer(Module):
 
         ### ESR 2026-09-08 actually used only for "directly memorize"
         #CMM : correlation matrix memory for the specific layer
-        if self.use_local_CMM or is_last:
+        if self.use_local_CMM:# or is_last:
            self.CMM = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
 
         
@@ -332,11 +332,10 @@ class MeMoLayer(Module):
 
     # The most simple implementation
     # Input sequence is has a shape of (self.h,self.d), that is self.h sequences are proposed as input rows
-    def memorize(self, input_sequence, output_symbols, is_last = False):
+    def memorize(self, input_sequence, output_symbols, to_save_sequences=None, is_last = False):
         (batch_size, blocks,h,d) = input_sequence.shape
         sequence_encoding, seq_enc_per_token = self.get_projections(input_sequence, blocks, h, d)
         penalization = False
-        
         
         # Updating local CMM
         if not is_last:
@@ -346,7 +345,7 @@ class MeMoLayer(Module):
                 surviving_vectors = sequence_encoding
             
             
-            if self.use_local_CMM and self.compositionOp == CompositionOp.JLT:
+            if self.use_local_CMM and self.compOp == CompositionOp.JLT:
                 if DEBUGGING:
                     print("Memorizing in local CMM seq_enc_per_tolen^T * (survived) sequence encodings")
                 CMM_update = torch.matmul(torch.transpose(seq_enc_per_token, -2, -1), surviving_vectors)/np.power(1.06,batch_size)
@@ -381,9 +380,35 @@ class MeMoLayer(Module):
         #    print(f"seq_enc_plus_out : {seq_enc_per_token.shape} {torch.transpose(seq_enc_per_token,-2,-1).shape} +  {output_symbols.shape}")
         # seq_enc_plus_out = torch.matmul(torch.transpose(seq_enc_per_token,-2,-1), output_symbols) 
 
-        if DEBUGGING:
-            print(f"seq_enc_plus_out : {sequence_encoding.shape} {torch.transpose(sequence_encoding,-2,-1).shape} +  {output_symbols.shape}")
-        seq_enc_plus_out = torch.matmul(torch.transpose(sequence_encoding,-2,-1), output_symbols)
+
+        # ESR 2026-09-17 
+        if to_save_sequences is not None:
+            to_save_output_symbols = output_symbols[:, to_save_sequences]
+        else:
+            to_save_output_symbols = output_symbols
+        
+            
+        if self.compOp == CompositionOp.JLT:
+            
+            if to_save_sequences is not None:
+                to_save_seq_enc_per_token = seq_enc_per_token[:, to_save_sequences]
+            else:
+                to_save_seq_enc_per_token = seq_enc_per_token
+
+            if DEBUGGING:
+                print(f"to_save_seq_enc_per_token : {to_save_seq_enc_per_token.shape} {torch.transpose(to_save_seq_enc_per_token,-2,-1).shape} +  {to_save_output_symbols.shape}")
+            
+            seq_enc_plus_out = torch.matmul(torch.transpose(to_save_seq_enc_per_token,-2,-1), to_save_output_symbols) 
+        else:
+            if to_save_sequences is not None:
+                to_save_sequence_encoding = sequence_encoding[:, to_save_sequences]
+            else:
+                to_save_sequence_encoding = sequence_encoding
+            
+            if DEBUGGING:
+                print(f"seq_enc_plus_out : {to_save_sequence_encoding.shape} {torch.transpose(to_save_sequence_encoding,-2,-1).shape} +  {to_save_output_symbols.shape}")
+            
+            seq_enc_plus_out = torch.matmul(torch.transpose(to_save_sequence_encoding,-2,-1), to_save_output_symbols)
         
         ## Key (sequenze di h token) x Value ==> matrice??
         if self.layerized_CMM_OUT: 
@@ -436,7 +461,7 @@ class MeMoLayer(Module):
         ### ESR 2026-09-08 the tokens projections
         # if self.use_local_CMM:
         #     retrieved_sequence_encoding = self.CMM(seq_enc_per_token)
-        if self.use_local_CMM  and self.compositionOp == CompositionOp.JLT:
+        if self.use_local_CMM  and self.compOp == CompositionOp.JLT:
             retrieved_sequence_encoding = self.CMM(seq_enc_per_token)
 
         # pad, pad, pad 1 --> 2
@@ -451,12 +476,21 @@ class MeMoLayer(Module):
         # else:
         #     layered_out_token = None
         if self.layerized_CMM_OUT:
-            if DEBUGGING:
-                print("sequence_encoding.shape", sequence_encoding.shape) #1 16 2048
-                print(self.CMM_OUT)
-            layered_out_token = self.CMM_OUT(sequence_encoding)#[:,-1,:])
-            if DEBUGGING:
-                print("layered_out_token.shape", layered_out_token.shape)
+
+            if self.compOp == CompositionOp.JLT:
+                if DEBUGGING:
+                    print("seq_enc_per_token.shape", seq_enc_per_token.shape) #1 16 2048
+                    print(self.CMM_OUT)
+                layered_out_token = self.CMM_OUT(seq_enc_per_token)#[:,-1,:])
+                if DEBUGGING:
+                    print("layered_out_token.shape", layered_out_token.shape)
+            else:
+                if DEBUGGING:
+                    print("sequence_encoding.shape", sequence_encoding.shape) #1 16 2048
+                    print(self.CMM_OUT)
+                layered_out_token = self.CMM_OUT(sequence_encoding)#[:,-1,:])
+                if DEBUGGING:
+                    print("layered_out_token.shape", layered_out_token.shape)
             
             layered_out_token = F.normalize(layered_out_token, p=2, dim=1)
             

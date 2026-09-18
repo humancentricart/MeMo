@@ -208,7 +208,7 @@ class MeMo(MeMoPreTrainedModel):
         self.max_len = self.h**self.l
         self.chunk_length = chunk_length
         self.layerized_CMM_OUT = layerized_CMM_OUT
-        self.lambda_val = lambda_val
+        self.lambda_val = 1#0.5 #lambda_val
 
         self.padding_vector_component_values = padding_vector_component_values
         print("Padding input tokens in MeMo architecture: ", self.padding_vector_component_values)
@@ -390,10 +390,13 @@ class MeMo(MeMoPreTrainedModel):
                 
 
             ## update the input sequence for the next layer
+            start = self.h**layer_level if layer_level != 0 else 0
             input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].memorize(input_sequence, 
                                                                                                 output_symbols, 
+                                                                                                to_save_sequences=range(start, input_sequence.shape[1]),
                                                                                                 is_last=(layer_level == self.l-1))
-            last_layer.directly_memorize(seq_encoding_for_the_last_layer)
+            if last_layer.use_local_CMM:
+                last_layer.directly_memorize(seq_encoding_for_the_last_layer)
         
     
     def memorize_text(self, memo_input):
@@ -543,7 +546,7 @@ class MeMo(MeMoPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (sequence_representation,)
 
-
+            
             outputs = self.layers[layer_level].retrieve(
                 sequence_representation,
                 layer_past=past_key_values,
@@ -588,7 +591,11 @@ class MeMo(MeMoPreTrainedModel):
         if self.layerized_CMM_OUT: 
             last_token_representation = residual_stream
         else:
-            last_token_representation = last_layer.directly_retrieve(encoding_for_the_last_layer)
+            if self.use_local_CMM:
+                last_token_representation = last_layer.directly_retrieve(encoding_for_the_last_layer)
+            else:
+                # ESR 2026-09-17 the interleaving setting of use_local_CMM and residyal-stream implementation is confusing!
+                print("last_token_representation not correcty defined!")
         
         ## the old decode step should be in the ForCausalLM pass only (and here one perform the retri)
         #retreived_output_symbol_vector, score_max = self.encoder.decode(last_token_representation)
@@ -687,7 +694,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             cache_position=cache_position
         )
 
-        last_token_representation = outputs['residual_stream_unpacked']   # 
+        last_token_representation = outputs['residual_stream_unpacked']   # ['last_token_representation'] # 
         ## ESR 2026-09-16
         #print("last_token_representation.shape", last_token_representation.shape)
         #the greedy decode step
