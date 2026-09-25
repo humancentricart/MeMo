@@ -194,8 +194,9 @@ class CorrelationMatrixMemory(Module):
 from enum import Enum
 class CompositionOp(Enum):
     JLT = 1
-    Prod = 2
-    Sum = 3
+    PROD = 2
+    SUM = 3
+    PRODWITHSHUFFLING = 4
 
 
 class MeMoLayer(Module):
@@ -220,7 +221,10 @@ class MeMoLayer(Module):
             print("Init of JLT projections matrices")
             self.W_v_single_head = ProjectionTokens(self.d, self.d_k, init_weights=init_weights)
             self.Prj = ProjectionSequence(self.d, self.d*self.h, init_weights=init_weights)
-        
+
+
+        if self.compOp == CompositionOp.PRODWITHSHUFFLING:
+            self.shuff = torch.randperm(self.d)
 
         ### ESR 2026-09-08 actually used only for "directly memorize"
         #CMM : correlation matrix memory for the specific layer
@@ -249,8 +253,12 @@ class MeMoLayer(Module):
         # shape (blocks,self.d)
         #print(input_sequence.reshape((blocks,self.d * self.h)).shape)
         batch_size = input_sequence.shape[0]
-        if self.compOp == CompositionOp.Prod:
+        if self.compOp == CompositionOp.PROD:
             sequence_encoding = torch.prod(input_sequence,2)
+            sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
+            return sequence_encoding, None
+        elif self.compOp == CompositionOp.PRODWITHSHUFFLING:
+            sequence_encoding = self.prod_with_shuf(input_sequence)
             sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
             return sequence_encoding, None
 
@@ -263,19 +271,34 @@ class MeMoLayer(Module):
             
             return sequence_encoding, seq_enc_per_token
         
-        elif self.compOp == CompositionOp.Sum:
+        elif self.compOp == CompositionOp.SUM:
             sequence_encoding = torch.sum(input_sequence,2)
             sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
             return sequence_encoding, None
         else: 
             print("ERROR")
-        
-        
 
         #print('sequence_encoding', sequence_encoding.shape)
         #print('seq_enc_per_token', seq_enc_per_token.shape)
-        
+    def prod_with_shuf(self, input_sequence):
+        B, L, H, D = input_sequence.shape
+        device = input_sequence.device
 
+        sequence_encoding = torch.empty((B, L, D), device=device)
+
+        for b in range(B):
+            for l in range(L):
+                v = input_sequence[b, l]  # vettori: a, b, c, d, ...
+                # iniziamo dall'ultimo vettore
+                acc = v[-1]
+                acc = acc[self.shuff]  # shuf(d)
+                # riduzione ricorsiva con shuffle
+                for i in range(H - 2, -1, -1):
+                    acc = v[i] * acc
+                    acc = acc[self.shuff]  # shuf(a * acc)
+
+                    sequence_encoding[b, l] = acc
+        return sequence_encoding
 
     def penalize(self, sequence_encoding, seq_enc_per_token):
         # Penalizing factors to avoid multiple storage of the same sequence encoding in intermediate CMMs

@@ -230,6 +230,7 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
         pad_masking[:, -1] = 0 # ensuring that EOS is not considered as padding, even if pad_tok_id == eos_tok_id
         inverse_pad_masking = (pad_masking == 0).type(torch.int) #torch.ones(pad_masking == 0, dtype=torch.long, device=self.memo.device)
         labels = pad_masking * -100 + inverse_pad_masking * labels
+#        labels = pad_masking * 0 + inverse_pad_masking * labels #############TEMPPPPPP
 
         return dict(
             input_ids=input_ids,

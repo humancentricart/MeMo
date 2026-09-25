@@ -36,7 +36,7 @@ import math
 
 VERBOSE = False
 #DEVICE = 'cpu'
-DEBUGGING = False
+DEBUGGING = True
 
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
@@ -174,7 +174,8 @@ class MeMo(MeMoPreTrainedModel):
             init_weights=False, ## disable the initialization of weights from the constructor (done in the post_init)
             
             alpha_gen=config.alpha_gen,
-            compositionOp=CompositionOp.Prod if config.compositionOp=='prod' else CompositionOp.JLT, #CompositionOp.Prod
+            #compositionOp=CompositionOp.Prod if config.compositionOp=='prod' else CompositionOp.JLT, #CompositionOp.Prod
+            compositionOp = CompositionOp[config.compositionOp.upper()] ,
             padding_vector_component_values=config.padding_vector_component_values if config.padding_vector_component_values is not None else 0
         )
         
@@ -196,7 +197,7 @@ class MeMo(MeMoPreTrainedModel):
 
                 alpha_gen=1,
                 layerized_CMM_OUT = True,
-                compositionOp=CompositionOp.Prod,
+                compositionOp=CompositionOp.PROD,
                 padding_vector_component_values=0,
                 lambda_val=0.9,
         ): #, device=None):
@@ -231,12 +232,23 @@ class MeMo(MeMoPreTrainedModel):
         )
 
     def generate_sequences(self, input_seqs, layer: int):
+
+        #def gen_input_output_for_next_layer_5(plain_input, prev_outputs, heads, sequenc_len, layer):
+        #    plain_input = ["no" for x in range(0, (heads - 1) * (heads ** (layer - 1)))] + plain_input
+        #    prev_outputs = prev_outputs
+        #    # final = sequenc_len+(heads-1)*heads**(layer-1)
+        #    print(f"Plain input    : {len(plain_input)}  - Prev : {len(prev_outputs)} ")
+        #    #    input = [[plain_input[j] for j in range(i-heads**layer,i,heads**(layer-1))] for i in range(heads**layer,final)]
+        #    input = [[plain_input[j * heads ** (layer - 1) + i] for j in range(0, heads)] for i in range(len(prev_outputs))]
+        #    output = [prev_outputs[i] for i in range(sequenc_len - 1)]
+        #    return input, output
+        #if not num_output_symbols:
+        #    eee = [[j * self.h ** (layer) + i for j in range(0, self.h)] for i in range(num_output_symbols)]
+
         h = self.h
         batch_size, seq_len, hidden_dim = input_seqs.shape
         device = input_seqs.device
 
-        # Distance between selected positions
-        step = h ** layer
 
         # Construct:
         #
@@ -257,6 +269,12 @@ class MeMo(MeMoPreTrainedModel):
         # [-1, -1,  3,  7],
         # [-1,  0,  4,  8],
         # ...
+
+        #    [[j * self.h ** (layer) + i for j in range(0, self.h)] for i in range(num_output_symbols)]
+        #    [[j * step + i for j in range(0, self.h)] for i in range(num_output_symbols)]
+
+        # Distance between selected positions
+        step = h ** layer
         positions = torch.arange(seq_len, device=device)
 
         offsets = (
@@ -390,10 +408,10 @@ class MeMo(MeMoPreTrainedModel):
                 
 
             ## update the input sequence for the next layer
-            start = self.h**layer_level if layer_level != 0 else 0
+            start = self.h**layer_level if layer_level != 0 else 0 #### WORKING
             input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].memorize(input_sequence, 
                                                                                                 output_symbols, 
-                                                                                                to_save_sequences=range(start, input_sequence.shape[1]),
+                                                                                                to_save_sequences=range(start, input_sequence.shape[1]), ### FMZ 2026-09-24
                                                                                                 is_last=(layer_level == self.l-1))
             if last_layer.use_local_CMM:
                 last_layer.directly_memorize(seq_encoding_for_the_last_layer)
