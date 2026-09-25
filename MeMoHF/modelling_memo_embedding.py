@@ -134,6 +134,7 @@ class MeMoEmbedding(Embedding):
         num_embeddings: int,
         embedding_dim: int,
         padding_idx: Optional[int] = None,
+        padding_seq_idx: Optional[int] = None,
         max_norm: Optional[float] = None,
         norm_type: float = 2.0,
         scale_grad_by_freq: bool = False,
@@ -145,7 +146,8 @@ class MeMoEmbedding(Embedding):
 
         mean = None,
         std=None,
-        init_weights=True
+        init_weights=True,
+        padding_vector_component_values = 0  #### FMZ 2026-07-01
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super(Embedding, self).__init__() 
@@ -162,10 +164,22 @@ class MeMoEmbedding(Embedding):
                 ), "Padding_idx must be within num_embeddings"
                 padding_idx = self.num_embeddings + padding_idx
         self.padding_idx = padding_idx
+        if padding_seq_idx is not None:
+            if padding_seq_idx > 0:
+                assert (
+                    padding_seq_idx < self.num_embeddings
+                ), "padding_seq_idx must be within num_embeddings"
+            elif padding_seq_idx < 0:
+                assert (
+                    padding_seq_idx >= -self.num_embeddings
+                ), "padding_seq_idx must be within num_embeddings"
+                padding_seq_idx = self.num_embeddings + padding_seq_idx
+        self.padding_seq_idx = padding_seq_idx
         self.max_norm = max_norm
         self.norm_type = norm_type
         self.scale_grad_by_freq = scale_grad_by_freq
-
+        self.padding_vector_component_values = padding_vector_component_values  #### FMZ 2026-07-01
+        print(self.__class__.__name__, self.padding_vector_component_values)
         ### MeMo initilialization
         if mean is None:
             self.mean = 0
@@ -174,7 +188,7 @@ class MeMoEmbedding(Embedding):
         
         #if _weight is None:
         self.weight = Parameter(
-            torch.empty((num_embeddings, embedding_dim), **factory_kwargs),
+            torch.empty((self.num_embeddings, self.embedding_dim), **factory_kwargs),
             requires_grad=not _freeze,
         )
 
@@ -189,21 +203,48 @@ class MeMoEmbedding(Embedding):
 
         self.sparse = sparse
 
-    def _init_weights(self):
+    
+    def _initialize_weights(self):
         self.reset_parameters()
     
     def reset_parameters(self) -> None:
         ### MeMo initilialization
-        print("MeMo embedding initilialization")
+        print("MeMo embedding initilialization: ", self.__class__.__name__)
+        print("Padding vector components : " , self.padding_vector_component_values)
         init.normal_(self.weight, mean=self.mean, std=self.std) # TODO add generator?
-        
-        self._fill_padding_idx_with_zero()
+        #print(f"SHAPE: {self.weight.shape}")
+        #self.weight.data = self.weight.data.view(-1)[torch.randperm(self.weight.data.numel())].reshape(self.weight.data.shape)
+        #self._fill_padding_idx_with_zero()
+        #self._fill_padding_idx_with_ones()
+        self._fill_padding_idx_with_component_values() #### FMZ 2026-07-01
+        self._fill_padding_seq_idx_with_one()
 
     def _fill_padding_idx_with_zero(self) -> None:
         if self.padding_idx is not None:
             with torch.no_grad():
                 self.weight[self.padding_idx].fill_(0)
 
+    def _fill_padding_idx_with_ones(self) -> None:
+        if self.padding_idx is not None:
+            with torch.no_grad():
+                self.weight[self.padding_idx].fill_(1)
+
+    def _fill_padding_seq_idx_with_one(self) -> None:
+        if self.padding_vector_component_values != 'in_distribution':    # ESR 2026-09-03 padding token from the same distribution of other tokens
+            with torch.no_grad():
+                    self.weight[self.padding_seq_idx].fill_(self.padding_vector_component_values)
+        else:
+            print("Padding in distribution")
+
+    #### FMZ 2026-07-01 
+    def _fill_padding_idx_with_component_values(self) -> None:
+        if self.padding_idx is not None:
+            if self.padding_vector_component_values != 'in_distribution': # ESR 2026-09-03 padding token from the same distribution of other tokens
+                with torch.no_grad():
+                    self.weight[self.padding_idx].fill_(self.padding_vector_component_values)
+            else:
+                print("Padding in distribution")
+                
     def forward(self, input: Tensor) -> Tensor:
         return F.embedding(
             input.to(self.weight.device),
@@ -231,11 +272,16 @@ class MeMoEmbedding(Embedding):
 
 
     def encode(self, input:Tensor) -> Tensor:
-        return self.forward(input)
+        out = self.forward(input)
+        #print("out for embedding: ", out)
+        return out
     
     ### usage as unembedding matrix, used in CausaLMHead 
     def lm_logits(self, input_embeddings):
-        return torch.matmul(input_embeddings, self.weight.T)
+        if len(input_embeddings.shape) < 3:
+            input_embeddings = torch.unsqueeze(input_embeddings, dim=1) #add a dimension for seq_len for compatibility reasons
+        logits = torch.matmul(input_embeddings, self.weight.T)
+        return logits 
     
     
     def decode(self, input_embeddings):

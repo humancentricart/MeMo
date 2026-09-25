@@ -14,13 +14,21 @@ from transformers.utils import logging
 
 
 from .modelling_memo_exception import MeMoException
+import numpy as np
 # self.Prj = torch.normal(0, 1/math.sqrt(self.d*self.h), size=(self.d,self.d*self.h))
 # self.Prj = torch.transpose(self.Prj, 0, 1)
 
 # as in Linear torch.nn.modules.linear
 
+import torch.nn.functional as F
+
+
+DEBUGGING = False
 verbose = False
 
+
+# if DEBUGGING:
+#     import matplotlib.pyplot as plt
 
 class ProjectionSequence(Module):
     __constants__ = ["in_features", "out_features"]
@@ -53,7 +61,8 @@ class ProjectionSequence(Module):
         if init_weights:
             self.reset_parameters()
 
-    def _init_weights(self):
+
+    def _initialize_weights(self):
         self.reset_parameters()
         
     def reset_parameters(self) -> None:
@@ -104,7 +113,8 @@ class ProjectionTokens(Module):
         if init_weights:
             self.reset_parameters()
 
-    def _init_weights(self):
+
+    def _initialize_weights(self):
         self.reset_parameters()
         
     def reset_parameters(self) -> None:
@@ -147,8 +157,9 @@ class CorrelationMatrixMemory(Module):
         self.register_parameter("bias", None)
         if init_weights:
             self.reset_parameters()
+    
 
-    def _init_weights(self):
+    def _initialize_weights(self):
         self.reset_parameters()
         
     def reset_parameters(self) -> None:
@@ -179,25 +190,55 @@ class CorrelationMatrixMemory(Module):
 
 
 
+
+from enum import Enum
+class CompositionOp(Enum):
+    JLT = 1
+    PROD = 2
+    SUM = 3
+    PRODWITHSHUFFLING = 4
+
+
 class MeMoLayer(Module):
     
-    def __init__(self, inner_dim, num_of_heads, init_weights=True, **kwargs):
+    def __init__(self, inner_dim, num_of_heads, init_weights=True, is_last=False, alpha=1, compositionOp=CompositionOp.JLT, layerized_CMM_OUT = True, **kwargs):
         super().__init__()
         
+        self.alpha = alpha # computed vs. memorized sequence decoding (alpha = 1 only computed)
         self.d = inner_dim
         self.h = num_of_heads
         self.d_k = self.d // self.h
         if self.d / self.h != self.d_k:
             raise MeMoException("Inner dimension " + str(self.d) + " should be divisible for number of heads " + str(self.h))
 
-        self.W_v_single_head = ProjectionTokens(self.d, self.d_k, init_weights=init_weights)
-        self.Prj = ProjectionSequence(self.d, self.d*self.h, init_weights=init_weights)
-        # CMM : correlation matrix memory for the specific layer
-        self.CMM = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
-        # CMM OUT : correlation matrix memory for the specific layer
-        #self.CMM_OUT = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
+        
+        self.compOp = compositionOp
 
-    def _init_weights(self):
+        self.use_local_CMM = (alpha < 1)
+        
+        ### ESR 2026-09-08 init of the projection matrices only if the composition operation is the JLT
+        if self.compOp == CompositionOp.JLT:
+            print("Init of JLT projections matrices")
+            self.W_v_single_head = ProjectionTokens(self.d, self.d_k, init_weights=init_weights)
+            self.Prj = ProjectionSequence(self.d, self.d*self.h, init_weights=init_weights)
+
+
+        if self.compOp == CompositionOp.PRODWITHSHUFFLING:
+            self.shuff = torch.randperm(self.d)
+
+        ### ESR 2026-09-08 actually used only for "directly memorize"
+        #CMM : correlation matrix memory for the specific layer
+        if self.use_local_CMM:# or is_last:
+           self.CMM = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
+
+        
+        self.layerized_CMM_OUT = layerized_CMM_OUT ### FMZ 2026:05:04
+        # CMM OUT : correlation matrix memory for the specific layer
+        if self.layerized_CMM_OUT: 
+            self.CMM_OUT = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights) ### FMZ 2026:05:04
+
+
+    def _initialize_weights(self):
         self.reset_parameters()
         
     def reset_parameters(self):
@@ -212,37 +253,97 @@ class MeMoLayer(Module):
         # shape (blocks,self.d)
         #print(input_sequence.reshape((blocks,self.d * self.h)).shape)
         batch_size = input_sequence.shape[0]
+        if self.compOp == CompositionOp.PROD:
+            sequence_encoding = torch.prod(input_sequence,2)
+            sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
+            return sequence_encoding, None
+        elif self.compOp == CompositionOp.PRODWITHSHUFFLING:
+            sequence_encoding = self.prod_with_shuf(input_sequence)
+            sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
+            return sequence_encoding, None
+
+        ## ESR 2026-09-06 still unclear to me 
+        elif self.compOp == CompositionOp.JLT:
+            sequence_encoding = self.Prj(input_sequence.reshape((batch_size, blocks, self.d * self.h)))
         
-        sequence_encoding = self.Prj(input_sequence.reshape((batch_size, blocks, self.d * self.h)))
-        # shape (blocks,self.d)
-        seq_enc_per_token = self.W_v_single_head(input_sequence) / math.sqrt(self.h)
-        seq_enc_per_token = seq_enc_per_token.reshape((batch_size, blocks, self.d))
+            seq_enc_per_token = self.W_v_single_head(input_sequence) / math.sqrt(self.h)
+            seq_enc_per_token = seq_enc_per_token.reshape((batch_size, blocks, self.d))
+            
+            return sequence_encoding, seq_enc_per_token
+        
+        elif self.compOp == CompositionOp.SUM:
+            sequence_encoding = torch.sum(input_sequence,2)
+            sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
+            return sequence_encoding, None
+        else: 
+            print("ERROR")
 
         #print('sequence_encoding', sequence_encoding.shape)
         #print('seq_enc_per_token', seq_enc_per_token.shape)
-        return sequence_encoding, seq_enc_per_token
 
-    
+    def prod_with_shuf(self, input_sequence):
+        B, L, H, D = input_sequence.shape
+        #device = input_sequence.device
+
+        # acc = shuf dell'ultimo vettore lungo H
+        acc = input_sequence[:, :, -1]  # (B, L, D)
+        acc = acc[:, :, self.shuff]  # shuf(d)
+
+        # riduzione ricorsiva vettorializzata
+        for i in range(H - 2, -1, -1):
+            acc = input_sequence[:, :, i] * acc  # (B, L, D)
+            acc = acc[:, :, self.shuff]  # shuf(a * acc)
+
+        return acc
+
+        #    def prod_with_shuf(self, input_sequence):
+        #        B, L, H, D = input_sequence.shape
+        #        device = input_sequence.device
+        #
+        #        sequence_encoding = torch.empty((B, L, D), device=device)
+        #        for b in range(B):
+        #            for l in range(L):
+        #                v = input_sequence[b, l]  # vettori: a, b, c, d, ...
+        #                # iniziamo dall'ultimo vettore
+        #                acc = v[-1]
+        #                acc = acc[self.shuff]  # shuf(d)
+        #                # riduzione ricorsiva con shuffle
+        #                for i in range(H - 2, -1, -1):
+        #                    acc = v[i] * acc
+        #                    acc = acc[self.shuff]  # shuf(a * acc)
+        #
+        #                    sequence_encoding[b, l] = acc
+        #        return sequence_encoding
+
     def penalize(self, sequence_encoding, seq_enc_per_token):
         # Penalizing factors to avoid multiple storage of the same sequence encoding in intermediate CMMs
         # This penalizing factor should merge the repetitions founds in the current sequence and the already stored
         # sequences in the current CMM
         # dimension = (blocks,1)
         batch_size = sequence_encoding.shape[0]
+        
         all_sequences = torch.sum(sequence_encoding, dim=1)
+        #print(f"Shape input sequences : {sequence_encoding.shape} - {all_sequences.shape}")
         # OLD : all_sequences = all_sequences.reshape(batch_size, self.d, 1)
         #print(all_sequences.shape) #(batch_size, d, 1)
-
         all_sequences = torch.sum(all_sequences, dim=0)
+
+        # as in MeMoCMM
+        #all_sequences = torch.sum(sequence_encoding, dim=0)
+
+        
         all_sequences = all_sequences.reshape(self.d, 1)
         #print(all_sequences.shape) #(batch_size, d, 1)
-
        
         stored_sequences_filter = 1 - torch.round(torch.matmul(self.CMM(seq_enc_per_token), all_sequences))
+        #stored_sequences_filter = 1 - torch.sum(torch.round(torch.matmul(sequence_encoding, torch.transpose(sequence_encoding, -2 ,-1))),dim=2)
         stored_sequences_filter[stored_sequences_filter < 0] = 0.0 # Sequences may appear more than once in all_sequences
         
         #print(stored_sequences_filter.shape)
-        new_sequences = torch.round(torch.matmul(sequence_encoding, all_sequences))
+        #new_sequences = torch.round(torch.matmul(sequence_encoding, all_sequences))
+        new_sequences = torch.sum(torch.round(torch.matmul(sequence_encoding, torch.transpose(sequence_encoding, -2 ,-1))),dim=2)
+        (batch,no_elem) = new_sequences.shape
+        new_sequences = new_sequences.reshape((batch,no_elem,1))
         #print(new_sequences.shape)
         
         #### Penalizing factors : provided that it is correct, elements with 0 are problematic. For the moment,
@@ -252,49 +353,130 @@ class MeMoLayer(Module):
         
         penalizing_factors[penalizing_factors == math.inf] = 0
         penalizing_factors[penalizing_factors == -math.inf] = 0
-    
+
+        if DEBUGGING:
+            print(f"Penalizing Factors Len: {penalizing_factors.shape} : {torch.sum(penalizing_factors,dim=1)}")
+            #(a,b,c) = penalizing_factors.shape
+            #to_display = torch.sum(torch.round(torch.matmul(sequence_encoding, torch.transpose(sequence_encoding, -2 ,-1))),dim=2)
+            #print(f"{sequence_encoding.shape} * {torch.transpose(sequence_encoding, -2 ,-1).shape} = {to_display.shape}" )
+            #print(f"new_sequences matrix : {to_display}")
+            #print(torch.matmul(sequence_encoding, all_sequences).reshape((a*b*c)))
+            #print(stored_sequences_filter.reshape((a*b*c)))
+            #print(penalizing_factors.reshape((a*b*c)))
         return sequence_encoding * penalizing_factors
+        #return sequence_encoding
     
+
+
     # The most simple implementation
     # Input sequence is has a shape of (self.h,self.d), that is self.h sequences are proposed as input rows
-    def memorize(self, input_sequence, output_symbols, is_last = False):
+    def memorize(self, input_sequence, output_symbols, to_save_sequences=None, is_last = False):
         (batch_size, blocks,h,d) = input_sequence.shape
         sequence_encoding, seq_enc_per_token = self.get_projections(input_sequence, blocks, h, d)
+        penalization = False
         
         # Updating local CMM
         if not is_last:
-            surviving_vectors = self.penalize(sequence_encoding, seq_enc_per_token)
-            # TODO
-            # batch ready? not for the sum, in general is always thought as 1 seq per input (in blocks)
-            #self.CMM = self.CMM + torch.matmul(torch.transpose(seq_enc_per_token, 0, 1), surviving_vectors)
-            CMM_update = torch.matmul(torch.transpose(seq_enc_per_token, -2, -1), surviving_vectors)
-            self.CMM.memorize(CMM_update)
+            if penalization: 
+                surviving_vectors = self.penalize(sequence_encoding, seq_enc_per_token)
+            else:
+                surviving_vectors = sequence_encoding
             
             
-        #### To be adjusted for taking into consideration the entire sequence
-        seq_enc_plus_out = torch.matmul(torch.transpose(seq_enc_per_token,-2,-1), output_symbols) ## Key (sequenze di h token) x Value ==> matrice??
+            if self.use_local_CMM and self.compOp == CompositionOp.JLT:
+                if DEBUGGING:
+                    print("Memorizing in local CMM seq_enc_per_tolen^T * (survived) sequence encodings")
+                CMM_update = torch.matmul(torch.transpose(seq_enc_per_token, -2, -1), surviving_vectors)/np.power(1.06,batch_size)
+                self.CMM.memorize(CMM_update)
+
+                # conflict on dependecies removed matplotlib
+                # if DEBUGGING:
+                #     #retrieved_sequence_encoding = self.CMM(seq_enc_per_token)
+                #     L_CMM = torch.sum(CMM_update,dim=0)
+                #     retrieved_sequence_encoding = torch.matmul(seq_enc_per_token,L_CMM)
+                #     print(f"{seq_enc_per_token.shape} * {L_CMM.shape} = {retrieved_sequence_encoding.shape}")
+                #     DEB_OUT = torch.matmul(retrieved_sequence_encoding,torch.transpose(surviving_vectors, -2, -1))
+                #     #DEB_OUT = torch.matmul(seq_enc_per_token,torch.transpose(seq_enc_per_token, -2, -1),)
+                #     #(_,NoSeqs,_) = DEB_OUT.shape  
+                #     diagonals = DEB_OUT.diagonal(dim1=1, dim2=2)
+                #     #print(f"{retrieved_sequence_encoding.shape} - {surviving_vectors.shape} {torch.transpose(surviving_vectors, -2, -1).shape} | What has been stored - SHAPE {DEB_OUT.shape} \n {diagonals}")
+                #     data = diagonals.to('cpu').view(-1).detach().numpy()
+                #     print(f"{DEB_OUT.shape} - - {data.shape}" )
+    
+                #     # Plot the distribution using a histogram
+                #     plt.hist(data, bins=30, density=True, alpha=0.7, color='blue')
+                #     plt.title("Distribution of Tensor Values")
+                #     plt.xlabel("Value")
+                #     plt.ylabel("Frequency")
+                #     plt.grid(True)
+                #     plt.show()
+            
+
+        #### ESR 2026-09-08 this is where we compute the map beteen input and output, changed to be the seq_encoding instead of concatenated, projected tokens
+        # # To be adjusted for taking into consideration the entire sequence
+        # if DEBUGGING: 
+        #    print(f"seq_enc_plus_out : {seq_enc_per_token.shape} {torch.transpose(seq_enc_per_token,-2,-1).shape} +  {output_symbols.shape}")
+        # seq_enc_plus_out = torch.matmul(torch.transpose(seq_enc_per_token,-2,-1), output_symbols) 
+
+
+        # ESR 2026-09-17 
+        if to_save_sequences is not None:
+            to_save_output_symbols = output_symbols[:, to_save_sequences]
+        else:
+            to_save_output_symbols = output_symbols
+        
+            
+        if self.compOp == CompositionOp.JLT:
+            
+            if to_save_sequences is not None:
+                to_save_seq_enc_per_token = seq_enc_per_token[:, to_save_sequences]
+            else:
+                to_save_seq_enc_per_token = seq_enc_per_token
+
+            if DEBUGGING:
+                print(f"to_save_seq_enc_per_token : {to_save_seq_enc_per_token.shape} {torch.transpose(to_save_seq_enc_per_token,-2,-1).shape} +  {to_save_output_symbols.shape}")
+            
+            seq_enc_plus_out = torch.matmul(torch.transpose(to_save_seq_enc_per_token,-2,-1), to_save_output_symbols) 
+        else:
+            if to_save_sequences is not None:
+                to_save_sequence_encoding = sequence_encoding[:, to_save_sequences]
+            else:
+                to_save_sequence_encoding = sequence_encoding
+            
+            if DEBUGGING:
+                print(f"seq_enc_plus_out : {to_save_sequence_encoding.shape} {torch.transpose(to_save_sequence_encoding,-2,-1).shape} +  {to_save_output_symbols.shape}")
+            
+            seq_enc_plus_out = torch.matmul(torch.transpose(to_save_sequence_encoding,-2,-1), to_save_output_symbols)
+        
+        ## Key (sequenze di h token) x Value ==> matrice??
+        if self.layerized_CMM_OUT: 
+            self.CMM_OUT.memorize(seq_enc_plus_out)  ### FMZ 2026:05:04
+        
         return sequence_encoding, seq_enc_plus_out
+
     
     def directly_memorize(self, input_sequence):
         self.CMM.memorize(input_sequence)
+        # print(self.CMM.weight)
 
-    def forget(self, input_sequence, output_symbols, completely=False, is_last = False):
-        (batch_size, blocks,h,d) = input_sequence.shape
-        sequence_encoding, seq_enc_per_token = self.get_projections(input_sequence, blocks, h, d)
+    # def forget(self, input_sequence, output_symbols, completely=False, is_last = False):
+    #     (batch_size, blocks,h,d) = input_sequence.shape
+    #     sequence_encoding, seq_enc_per_token = self.get_projections(input_sequence, blocks, h, d)
         
-        # Updating local CMM
-        if not is_last and completely:
-            surviving_vectors = self.penalize(sequence_encoding, seq_enc_per_token)
-            CMM_update = torch.matmul(torch.transpose(seq_enc_per_token, -2, -1), surviving_vectors)
-            self.CMM.forget(CMM_update)
+    #     # Updating local CMM
+    #     if not is_last and completely and self.use_local_CMM:
+    #         surviving_vectors = self.penalize(sequence_encoding, seq_enc_per_token)
+    #         CMM_update = torch.matmul(torch.transpose(seq_enc_per_token, -2, -1), surviving_vectors)
+    #         self.CMM.forget(CMM_update)
 
 
-        #### To be adjusted for taking into consideration the entire sequence
-        seq_enc_plus_out = torch.matmul(torch.transpose(seq_enc_per_token,-2,-1), output_symbols) ## Key (sequenze di h token) x Value ==> matrice??
-        return sequence_encoding, seq_enc_plus_out
+    #     #### To be adjusted for taking into consideration the entire sequence
+    #     seq_enc_plus_out = torch.matmul(torch.transpose(seq_enc_per_token,-2,-1), output_symbols) 
+    #     ## Key (sequenze di h token) x Value ==> matrice??
+    #     return sequence_encoding, seq_enc_plus_out
 
-    def directly_forget(self, input_sequence):
-        self.CMM.forget(input_sequence)
+    # def directly_forget(self, input_sequence):
+    #     self.CMM.forget(input_sequence)
 
     def retrieve(self, 
                  input_sequence: Optional[torch.Tensor] = None,
@@ -304,13 +486,60 @@ class MeMoLayer(Module):
                  cache_position: Optional[Union[Cache, torch.Tensor]] = None,
         ):
         
-        (batch_size, blocks, _, _) = input_sequence.shape
+        #(batch_size, blocks, _, _) = input_sequence.shape
         
-        seq_enc_per_token = self.W_v_single_head(input_sequence).reshape((batch_size, blocks, self.d)) / math.sqrt(self.h)
-        # print(seq_enc_per_token.shape) (batch_size, blocks, d)
-        retrieved_sequence_encoding = self.CMM(seq_enc_per_token)
+        (batch_size, blocks,h,d) = input_sequence.shape
+        sequence_encoding, seq_enc_per_token = self.get_projections(input_sequence, blocks, h, d)
+
 
         
+        #OLD VERSION: seq_enc_per_token = self.W_v_single_head(input_sequence).reshape((batch_size, blocks, self.d)) / math.sqrt(self.h)
+        # print(seq_enc_per_token.shape) (batch_size, blocks, d)
+        
+        ### ESR 2026-09-08 the tokens projections
+        # if self.use_local_CMM:
+        #     retrieved_sequence_encoding = self.CMM(seq_enc_per_token)
+        if self.use_local_CMM  and self.compOp == CompositionOp.JLT:
+            retrieved_sequence_encoding = self.CMM(seq_enc_per_token)
+
+        # pad, pad, pad 1 --> 2
+        # pad, pad, 1, 2 --> 3
+        # ...
+        # 1, 2, 3, 4 --> 4
+        # ESR 2026-09-08
+        # if self.layerized_CMM_OUT:
+        #     layered_out_token = self.CMM_OUT(seq_enc_per_token[:,-1,:])
+        #     layered_out_token = F.normalize(layered_out_token, p=2, dim=1)
+        #     #print(f"Adding {layered_out_token.shape}")
+        # else:
+        #     layered_out_token = None
+        if self.layerized_CMM_OUT:
+
+            if self.compOp == CompositionOp.JLT:
+                if DEBUGGING:
+                    print("seq_enc_per_token.shape", seq_enc_per_token.shape) #1 16 2048
+                    print(self.CMM_OUT)
+                layered_out_token = self.CMM_OUT(seq_enc_per_token)#[:,-1,:])
+                if DEBUGGING:
+                    print("layered_out_token.shape", layered_out_token.shape)
+            else:
+                if DEBUGGING:
+                    print("sequence_encoding.shape", sequence_encoding.shape) #1 16 2048
+                    print(self.CMM_OUT)
+                layered_out_token = self.CMM_OUT(sequence_encoding)#[:,-1,:])
+                if DEBUGGING:
+                    print("layered_out_token.shape", layered_out_token.shape)
+            
+            layered_out_token = F.normalize(layered_out_token, p=2, dim=1)
+            
+            if DEBUGGING:
+                print(f"Adding layered_out_token {layered_out_token.shape}")
+        else:
+            layered_out_token = None
+            
+        
+        ###### ESR 2026-09-08 please notice that this was already commented out
+        #TODO check and rewrite
         #if verbose:
         #    sequence_encoding = self.Prj(input_sequence.reshape((batch_size, blocks, self.d * self.h)))
         #    out = torch.matmul(sequence_encoding, torch.transpose(retrieved_sequence_encoding,-2,-1))
@@ -319,14 +548,34 @@ class MeMoLayer(Module):
         #    if torch.max(out1).item() > 1.5 or torch.max(out).item()> 1.5:
         #        print("Errore")
         # last token seq_enc_per_token[-1].reshape(batch_size,self.d)
+        #locally_predicted = self.CMM_OUT(seq_enc_per_token[-1].reshape(1,self.d))
+
+        #return retrieved_sequence_encoding, seq_enc_per_token[:, -1].reshape(batch_size,self.d)#, locally_predicted
+        #return sequence_encoding, seq_enc_per_token[:, -1].reshape(batch_size,self.d)#, locally_predicted
 
         
-        return OrderedDict([
-            ('sequence_encoding', retrieved_sequence_encoding),
-            ('token_encoding', seq_enc_per_token[:, -1].reshape(batch_size,self.d)),
-            ('cache', None)
-        ])
-         
+        
+        ### ESR 2026-09-08 ### added the check to avoid errors, but I do not think the interpretation below is correct
+        # the seq_enc_per_token was also before the representation for those tokens at that layer, not the "local prediction"
+        if seq_enc_per_token is not None:
+            token_encoding = seq_enc_per_token[:, -1].reshape(batch_size,self.d)
+        else:
+            token_encoding = None
+        
+        if self.use_local_CMM:
+            return dict(
+                sequence_encoding=self.alpha*sequence_encoding+(1-self.alpha)*retrieved_sequence_encoding, 
+                token_encoding=token_encoding,#, locally_predicted
+                layered_out_token=layered_out_token,
+                cache=None
+            )
+        else:
+            return dict(
+                sequence_encoding=sequence_encoding, 
+                token_encoding=token_encoding,#, locally_predicted
+                layered_out_token=layered_out_token,
+                cache=None 
+            )
 
     def directly_retrieve(self,vector):
         return self.CMM(vector)

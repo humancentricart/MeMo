@@ -5,6 +5,7 @@ import re
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from tqdm import tqdm
 
 import torch
 from torch import Tensor
@@ -16,19 +17,26 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.utils import logging
 from transformers.generation import GenerationMixin
+# from .gen_utils import GenerationMixin
 
 
 logger = logging.get_logger(__name__)
 
 from .modelling_memo_embedding import MeMoEmbedding
-from .modelling_memo_layer import MeMoLayer
+from .modelling_memo_layer import MeMoLayer, CompositionOp
 from .modelling_memo_configuration import MeMoConfig
 from .modelling_memo_exception import MeMoException
+from .utils import (
+    windowed_sequence, 
+    restore_windowed_sequence_outputs,
+    MemoForCausalLMLoss
+)
 
 import math
 
 VERBOSE = False
 #DEVICE = 'cpu'
+DEBUGGING = True
 
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
@@ -69,6 +77,8 @@ class MeMoModelOutputWithPast(ModelOutput):
     """
 
     last_token_representation: torch.FloatTensor = None
+    #ESR 2026-09-16
+    residual_stream_unpacked: torch.FloatTensor = None
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     hidden_tokens: Optional[Tuple[torch.FloatTensor, ...]] = None
@@ -112,8 +122,9 @@ class MeMoCausalLMOutputWithPast(ModelOutput):
 
 
 class MeMoLayers(ModuleList):
-    def _init_weights(self, module):
+    def _initialize_weights(self, module):
         pass
+
     def reset_parameters(self):
         pass
 
@@ -139,7 +150,8 @@ class MeMoPreTrainedModel(PreTrainedModel):
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
 
-    def _init_weights(self, module):
+
+    def _initialize_weights(self, module):
         """Initialize the weights. Recursevely called by post_init on each of the child module"""
         module.reset_parameters() 
     
@@ -158,7 +170,13 @@ class MeMo(MeMoPreTrainedModel):
             chunk_length=config.chunk_length, 
             num_embeddings=config.vocab_size,
             padding_idx=config.pad_token_id,
+            padding_seq_idx=config.padding_seq_idx, 
             init_weights=False, ## disable the initialization of weights from the constructor (done in the post_init)
+            
+            alpha_gen=config.alpha_gen,
+            #compositionOp=CompositionOp.Prod if config.compositionOp=='prod' else CompositionOp.JLT, #CompositionOp.Prod
+            compositionOp = CompositionOp[config.compositionOp.upper()] ,
+            padding_vector_component_values=config.padding_vector_component_values if config.padding_vector_component_values is not None else 0
         )
         
         self.gradient_checkpointing = False
@@ -167,8 +185,22 @@ class MeMo(MeMoPreTrainedModel):
         self.post_init() 
 
     
-    def _build_model(self, inner_dim, num_of_heads, num_of_layers, chunk_length, 
-                 num_embeddings, padding_idx=0, init_weights=True): #, device=None):
+    def _build_model(self, 
+                inner_dim, 
+                num_of_heads, 
+                num_of_layers, 
+                chunk_length, 
+                num_embeddings, 
+                padding_idx=0,
+                padding_seq_idx=-1,  
+                init_weights=True,
+
+                alpha_gen=1,
+                layerized_CMM_OUT = True,
+                compositionOp=CompositionOp.PROD,
+                padding_vector_component_values=0,
+                lambda_val=0.9,
+        ): #, device=None):
         #super().__init__()
         
         self.d = inner_dim
@@ -176,14 +208,108 @@ class MeMo(MeMoPreTrainedModel):
         self.l = num_of_layers
         self.max_len = self.h**self.l
         self.chunk_length = chunk_length
-        
-        if self.chunk_length/self.max_len != self.chunk_length//self.max_len:
-            raise MeMoException("Chunk length "+ str(self.chunk_length) + \
-                " should be divisible for number of heads power numer of layers ("+str(self.max_len) +")")
-        
-        self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights)
-        self.layers = MeMoLayers([MeMoLayer(self.d, self.h, init_weights=init_weights) for _ in range(num_of_layers)])
+        self.layerized_CMM_OUT = layerized_CMM_OUT
+        self.lambda_val = 1#0.5 #lambda_val
 
+        self.padding_vector_component_values = padding_vector_component_values
+        print("Padding input tokens in MeMo architecture: ", self.padding_vector_component_values)
+        
+        # if self.chunk_length/self.max_len != self.chunk_length//self.max_len:
+        #     raise MeMoException("Chunk length "+ str(self.chunk_length) + \
+        #         " should be divisible for number of heads power numer of layers ("+str(self.max_len) +")")
+        
+        #self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights)
+        #### FMZ 2026-07-01 - Trying with different encodings for input and for unencoding 
+        self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, padding_seq_idx=padding_seq_idx, 
+                                     init_weights=init_weights, padding_vector_component_values=self.padding_vector_component_values)        #### FMZ 2026-07-01 - Encoding in
+        self.output_encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, padding_seq_idx=padding_seq_idx, 
+                                            init_weights=init_weights, padding_vector_component_values=0) #### FMZ 2026-07-01 - Encoding out ## if !=0 accuracy drop
+        self.layers = MeMoLayers(
+            [
+                MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
+                for i in range(num_of_layers)
+            ]
+        )
+
+    def generate_sequences(self, input_seqs, layer: int):
+
+        #def gen_input_output_for_next_layer_5(plain_input, prev_outputs, heads, sequenc_len, layer):
+        #    plain_input = ["no" for x in range(0, (heads - 1) * (heads ** (layer - 1)))] + plain_input
+        #    prev_outputs = prev_outputs
+        #    # final = sequenc_len+(heads-1)*heads**(layer-1)
+        #    print(f"Plain input    : {len(plain_input)}  - Prev : {len(prev_outputs)} ")
+        #    #    input = [[plain_input[j] for j in range(i-heads**layer,i,heads**(layer-1))] for i in range(heads**layer,final)]
+        #    input = [[plain_input[j * heads ** (layer - 1) + i] for j in range(0, heads)] for i in range(len(prev_outputs))]
+        #    output = [prev_outputs[i] for i in range(sequenc_len - 1)]
+        #    return input, output
+        #if not num_output_symbols:
+        #    eee = [[j * self.h ** (layer) + i for j in range(0, self.h)] for i in range(num_output_symbols)]
+
+        h = self.h
+        batch_size, seq_len, hidden_dim = input_seqs.shape
+        device = input_seqs.device
+
+
+        # Construct:
+        #
+        # layer=0, h=4
+        #
+        # [-1, -1, -1,  0]
+        # [-1, -1,  0,  1]
+        # [-1,  0,  1,  2]
+        # [ 0,  1,  2,  3]
+        # layer=1, h=4
+        # [-1, -1, -1,  0],
+        # [-1, -1, -1,  1],
+        # [-1, -1, -1,  2],
+        # [-1, -1, -1,  3],
+        # [-1, -1,  0,  4],
+        # [-1, -1,  1,  5],
+        # [-1, -1,  2,  6],
+        # [-1, -1,  3,  7],
+        # [-1,  0,  4,  8],
+        # ...
+
+        #    [[j * self.h ** (layer) + i for j in range(0, self.h)] for i in range(num_output_symbols)]
+        #    [[j * step + i for j in range(0, self.h)] for i in range(num_output_symbols)]
+
+        # Distance between selected positions
+        step = h ** layer
+        positions = torch.arange(seq_len, device=device)
+
+        offsets = (
+            torch.arange(h, device=device) - (h - 1)
+        ) * step
+
+        whento = positions[:, None] + offsets[None, :]
+
+        # Everything before the sequence becomes PAD = -1
+        whento = whento.clamp(min=-1)
+        #if DEBUGGING:
+        #    print("whento (selected indexes for layer ", layer, "):", whento)
+
+        # Keep track of padding positions
+        valid = whento != -1
+
+        # Replace -1 with 0 temporarily for indexing
+        gather_indices = whento.clamp(min=0)
+
+        # [batch, seq_len, h, hidden_dim]
+        new_seqs = input_seqs[:, gather_indices]
+
+        # Padding embedding
+        padding = self.encoder.weight[
+            self.encoder.padding_seq_idx
+        ].view(1, 1, 1, hidden_dim)
+        # print("Padding:", padding)
+        # Replace invalid gathered values with padding
+        new_seqs = torch.where(
+            valid[None, :, :, None],
+            new_seqs,
+            padding
+        )
+
+        return new_seqs
         
     
     def forward(
@@ -223,15 +349,39 @@ class MeMo(MeMoPreTrainedModel):
     
     
     def memorize(self, input_ids, labels_ids):
+        # print("=== EMBEDDING DEBUG ===")
+        # print("input shape:", input_ids.shape)
+        # print("input dtype:", input_ids.dtype)
+        # print("input device:", input_ids.device)
+        
+        # print("embedding shape:", self.encoder.weight.shape)
+        # print("embedding device:", self.encoder.weight.device)
+        
+        # print("input min:", input_ids.min().item())
+        # print("input max:", input_ids.max().item())
+        
+        # print("padding_seq_idx:", self.encoder.padding_seq_idx)
+        
+        # assert input_ids.dtype == torch.long
+        # assert input_ids.min().item() >= 0
+        # assert input_ids.max().item() < self.encoder.weight.shape[0]
+        #print("INPUT SEQUENCES")
         input_sequence = self.encoder.encode(input_ids)
-        output_symbols = self.encoder.encode(labels_ids)
-        #print("input_sequence.shape", input_sequence.shape)
+        # output_symbols = self.encoder.encode(labels_ids)
+        #print("OUTPUT SEQUENCES")
+        output_symbols = self.output_encoder.encode(labels_ids) #### FMZ 2026-07-01
+        
 
         (batch_size, current_length, d) = input_sequence.shape
-        assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
+
+        # TODO check what are the implication with the new rule for selection
+        # if current_length > self.chunk_length: # truncate the sequence considering only the last [chunk_length] tokens
+        #     input_sequence = input_sequence[:, -self.chunk_length:, :]
+        # (batch_size, current_length, d) = input_sequence.shape
+        # assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
         
         last_layer = self.layers[self.l-1]
-        current_length = self.chunk_length
+        #current_length = self.chunk_length
         
         #for layer_level in range(self.l):
         #    current_length = current_length//self.h
@@ -247,24 +397,24 @@ class MeMo(MeMoPreTrainedModel):
         #    last_layer.directly_memorize(seq_encoding_for_the_last_layer)
 
         for layer_level in range(self.l):
-            if self.h ** (layer_level + 1) < current_length + 1:
-                ## update the input sequence for the next layer
-                layer_output_idxs = [i - self.h ** ((layer_level + 1) - 1) for i in range(self.h ** (layer_level + 1), current_length + 1)]
-                output_symbols = output_symbols[:, layer_output_idxs]
-                #print(output_symbols.shape)
+            input_sequence = self.generate_sequences(input_seqs=input_sequence, layer=layer_level)
+            
+            if DEBUGGING:
+                if layer_level == 0:
+                    print("Decoding input_sequence at layer 0")
+                    print(self.encoder.decode(input_sequence))
+                retreived_output_symbol_vector, max_value = self.output_encoder.decode(output_symbols) ### FMZ 2026-07-01
+                print(f"Layer {layer_level} - Output Sequence: {retreived_output_symbol_vector}")
                 
-                input_index = [[j for j in range(i - self.h ** (layer_level + 1), i, self.h ** ((layer_level + 1) - 1))] 
-                               for i in range(self.h ** (layer_level + 1), current_length + 1)]
-                input_sequence = input_sequence[:, input_index]
-                
-                
-                ## update the input sequence for the next layer
-                input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].memorize(input_sequence, 
-                                                                                                    output_symbols, 
-                                                                                                    is_last=(layer_level == self.l-1))
+
+            ## update the input sequence for the next layer
+            start = self.h**layer_level if layer_level != 0 else 0 #### WORKING
+            input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].memorize(input_sequence, 
+                                                                                                output_symbols, 
+                                                                                                to_save_sequences=range(start, input_sequence.shape[1]), ### FMZ 2026-09-24
+                                                                                                is_last=(layer_level == self.l-1))
+            if last_layer.use_local_CMM:
                 last_layer.directly_memorize(seq_encoding_for_the_last_layer)
-            else:
-                break
         
     
     def memorize_text(self, memo_input):
@@ -273,67 +423,34 @@ class MeMo(MeMoPreTrainedModel):
                       memo_input['labels'].to(self.device))
         
     
-    def forget(self, input_ids, labels_ids, completely=False):
-        input_sequence =  self.encoder.encode(input_ids)
-        output_symbols = self.encoder.encode(labels_ids)
+    # def forget(self, input_sequence_ids, labels_ids, completely=True):
+    #     input_sequence = self.encoder.encode(input_sequence_ids)
+    #     output_symbols = self.output_encoder.encode(labels_ids) #### FMZ 2026-07-01
 
-        (batch_size, current_length, d) = input_sequence.shape
-        assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
+    #     (batch_size, current_length, d) = input_sequence.shape
+    #     #assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
         
-        last_layer = self.layers[self.l-1]
-        current_length = self.chunk_length
+    #     last_layer = self.layers[self.l-1]
         
-        #for layer_level in range(self.l):
-        #    current_length = current_length//self.h
-        #    input_sequence = input_sequence.reshape((batch_size, current_length, self.h, self.d))
         
-        #    #print(f"per layer {layer_level} input_sequence.shape", input_sequence.shape)
-        #    #print(input_sequence[0])    
-        #    output_symbols = output_symbols[:, [(x+1)*self.h-1 for x in range(0, current_length)]]
-    
-        #    ## update the input sequence for the next layer
-        #    input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].forget(input_sequence, 
-        #                                                                                      output_symbols, 
-        #                                                                                      completely=completely,
-        #                                                                                      is_last=(layer_level == self.l-1))
-        #    
-        #    last_layer.directly_forget(seq_encoding_for_the_last_layer)
-
-        for layer_level in range(self.l):
-            #current_length = current_length//self.h
-            #input_sequence = input_sequence.reshape((batch_size, current_length, self.h, self.d))
-        
-            ##print(f"per layer {layer_level} input_sequence.shape", input_sequence.shape)
-            ##print(input_sequence[0])    
-            #output_symbols = output_symbols[:, [(x+1)*self.h-1 for x in range(0, current_length)]] ## the output symbol is always the same tokem?
-
+    #     for layer_level in range(self.l):
+    #         input_sequence = self.generate_sequences(input_seqs=input_sequence, layer=layer_level)
+    #         ## TODO how to debug now? 
+    #         input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].forget(input_sequence, 
+    #                                                                                             output_symbols, 
+    #                                                                                             completely=completely,
+    #                                                                                             is_last= (layer_level == self.l-1) )
             
-            if self.h ** (layer_level + 1) < current_length + 1:
-                ## update the input sequence for the next layer
-                layer_output_idxs = [i - self.h ** ((layer_level + 1) - 1) for i in range(self.h ** (layer_level + 1), current_length + 1)]
-                output_symbols = output_symbols[:, layer_output_idxs]
-                #print(output_symbols.shape)
-                
-                input_index = [[j for j in range(i - self.h ** (layer_level + 1), i, self.h ** ((layer_level + 1) - 1))] 
-                               for i in range(self.h ** (layer_level + 1), current_length + 1)]
-                input_sequence = input_sequence[:, input_index]
-                
-                input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].forget(input_sequence, 
-                                                                                                  output_symbols, 
-                                                                                                  completely=completely,
-                                                                                                  is_last= (layer_level == self.l-1) )
-                
-                last_layer.directly_forget(seq_encoding_for_the_last_layer)
-            else:
-                break
+    #         last_layer.directly_forget(seq_encoding_for_the_last_layer)
+            
         
         
     
-    def forget_text(self, memo_input, completely=True):
-        #for i in range(0,self.h):
-        self.forget(memo_input['input_ids'].to(self.device),
-                    memo_input['labels'].to(self.device), 
-                    completely=completely)
+    # def forget_text(self, memo_input, completely=True):
+    #     #for i in range(0,self.h):
+    #     self.forget(memo_input['input_ids'].to(self.device),
+    #                 memo_input['labels'].to(self.device), 
+    #                 completely=completely)
 
     
     def retrieve(self,
@@ -368,7 +485,9 @@ class MeMo(MeMoPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds = self.encoder(input_ids)
+            ### This is the specific point where padding tokens are added
+            inputs_embeds = self.encoder.encode(input_ids)
+            #### 
         
         seq_length = inputs_embeds.shape[0]
 
@@ -383,11 +502,19 @@ class MeMo(MeMoPreTrainedModel):
         sequence_representation = inputs_embeds
 
         (batch_size, current_length, d) = sequence_representation.shape
-        assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
+        # if current_length > self.chunk_length: # truncate the sequence considering only the last [chunk_length] tokens
+        #     sequence_representation = sequence_representation[:, -self.chunk_length:, :]
+        # (batch_size, current_length, d) = sequence_representation.shape
+        # assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
         
         encoding_for_the_last_layer = torch.zeros((batch_size, self.d)).to(self.device)
-        current_length = self.chunk_length #min(self.chunk_length, self.max_len)
-
+        #current_length = self.chunk_length #min(self.chunk_length, self.max_len)
+        
+        
+        if self.layerized_CMM_OUT: 
+            residual_stream = torch.zeros((batch_size, self.chunk_length, self.d)).to(self.device)
+            residual_stream_unpacked = torch.zeros((self.l, batch_size, self.chunk_length, self.d)).to(self.device)
+        
         # moved outside the logic for tokenization, here only assertiion above
         #if len(input_sequence) > current_length:
         #    input_sequence = input_sequence[len(input_sequence)-current_length:len(input_sequence)]
@@ -432,13 +559,12 @@ class MeMo(MeMoPreTrainedModel):
         #    #    print((retreived_output_symbol_vector, score_max))
 
         for layer_level in range(self.l):
-            current_length = int(current_length/self.h)
-            sequence_representation = sequence_representation.reshape((batch_size, current_length, self.h, self.d))
+            sequence_representation = self.generate_sequences(input_seqs=sequence_representation, layer=layer_level)
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (sequence_representation,)
 
-
+            
             outputs = self.layers[layer_level].retrieve(
                 sequence_representation,
                 layer_past=past_key_values,
@@ -450,7 +576,27 @@ class MeMo(MeMoPreTrainedModel):
             )
             
             sequence_representation, seq_encoding_for_the_last_layer = outputs['sequence_encoding'], outputs['token_encoding']
-            encoding_for_the_last_layer += seq_encoding_for_the_last_layer
+            #print("sequence_representation.shape", sequence_representation.shape)
+            #print("outputs['layered_out_token'].shape", outputs['layered_out_token'].shape)
+            #print(self.output_encoder.decode(outputs['layered_out_token']))
+            #print("residual_stream.shape", residual_stream.shape)
+            ### ESR 2026-09-08 this is the direct way to avoid errors, but with compOp == prod I lost track of what it is supposed to be
+            if seq_encoding_for_the_last_layer is not None:
+                encoding_for_the_last_layer += seq_encoding_for_the_last_layer
+            
+            # This is to capture the layer by layer extraction of the next token: the output of each layer is normalized in order to 
+            # penalize short sequences 
+            # if self.layerized_CMM_OUT: 
+            #     residual_stream += outputs['layered_out_token']
+            if self.layerized_CMM_OUT: 
+                #residual_stream += outputs['layered_out_token']
+                # residual_stream = torch.linalg.norm(outputs['layered_out_token'] + self.lambda_val * residual_stream, dim=0, keepdim=True)
+                residual_stream = F.normalize(
+                    outputs['layered_out_token'] + self.lambda_val * residual_stream,
+                    p=2,
+                    dim=1
+                )
+                residual_stream_unpacked[layer_level] = outputs['layered_out_token']
 
 
         # Add last hidden state
@@ -460,7 +606,14 @@ class MeMo(MeMoPreTrainedModel):
         next_cache = next_decoder_cache if use_cache else None
 
         last_layer = self.layers[self.l-1]
-        last_token_representation = last_layer.directly_retrieve(encoding_for_the_last_layer)
+        if self.layerized_CMM_OUT: 
+            last_token_representation = residual_stream
+        else:
+            if self.use_local_CMM:
+                last_token_representation = last_layer.directly_retrieve(encoding_for_the_last_layer)
+            else:
+                # ESR 2026-09-17 the interleaving setting of use_local_CMM and residyal-stream implementation is confusing!
+                print("last_token_representation not correcty defined!")
         
         ## the old decode step should be in the ForCausalLM pass only (and here one perform the retri)
         #retreived_output_symbol_vector, score_max = self.encoder.decode(last_token_representation)
@@ -474,12 +627,13 @@ class MeMo(MeMoPreTrainedModel):
         
         return MeMoModelOutputWithPast(
             last_token_representation=last_token_representation,
+            residual_stream_unpacked=residual_stream_unpacked,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             hidden_tokens=all_hidden_tokens,
         )
 
-        
+# from .loss_utils import ForCausalLMLoss
 
 class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
@@ -487,25 +641,27 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.memo = MeMo(config)
-        self.lm_head = self.memo.encoder # same embedding and un-embedding matrix
-        
+        #self.lm_head = self.memo.encoder # same embedding and un-embedding matrix
+        self.lm_head = self.memo.output_encoder # FMZ 2026-07-01 different embedding and un-embedding matrix
+        # self.loss_function = ForCausalLMLoss
         # Initialize weights and apply final processing
         self.post_init()
+        self.loss_function = MemoForCausalLMLoss 
 
         
 
-    def forget_text(self, memo_input, completely=True):
-        return self.memo.forget_text(
-            memo_input=memo_input,
-            completely=completely
-        )
+    # def forget_text(self, memo_input, completely=True):
+    #     return self.memo.forget_text(
+    #         memo_input=memo_input,
+    #         completely=completely
+    #     )
     
-    def forget(self, input_ids, labels_ids, completely=True):
-        return self.memo.forget(
-            input_ids=input_ids,    
-            labels_ids=labels_ids,
-            completely=completely
-        )
+    # def forget(self, input_ids, labels_ids, completely=True):
+    #     return self.memo.forget(
+    #         input_ids=input_ids,    
+    #         labels_ids=labels_ids,
+    #         completely=completely
+    #     )
 
         
     def memorize_text(self, memo_input):
@@ -530,11 +686,14 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         position_ids: Optional[torch.Tensor] = None,
         #head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
         output_hidden_token: Optional[bool] = None, #output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None):
+        cache_position: Optional[torch.LongTensor] = None,
+        compute_loss: Optional[bool] = False
+    ):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
@@ -553,14 +712,41 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             cache_position=cache_position
         )
 
-        last_token_representation = outputs['last_token_representation']
-        
+        last_token_representation = outputs['residual_stream_unpacked']   # ['last_token_representation'] # 
+        ## ESR 2026-09-16
+        #print("last_token_representation.shape", last_token_representation.shape)
         #the greedy decode step
         #retrieved_output_symbol_vector, score_max = self.lm_head.decode(last_token_representation)
         #return retrieved_output_symbol_vector, score_max
     
         lm_logits = self.lm_head.lm_logits(last_token_representation)
-        loss = None
+        ## ESR 2026-09-16
+        #print("lm_logits.shape", lm_logits.shape)
+
+
+        num_layers = self.memo.l
+        decay = self.memo.lambda_val
+        
+        weights = decay ** torch.arange(
+            num_layers - 1, -1, -1,
+            device=lm_logits.device
+        )
+        ## ESR 2026-09-16
+        #print(weights)
+        # [num_layers] -> [num_layers, 1, 1, 1]
+        weights = weights.view(num_layers, 1, 1, 1)
+        
+        lm_logits = (lm_logits * weights).sum(dim=0) / weights.sum()
+        
+        ## ESR 2026-09-16
+        #print("lm_logits.shape", lm_logits.shape)
+        
+        loss = None # TODO: compute the loss function
+        # if labels is not None:
+        #     # default loss: transformers.loss.loss_utility.ForCausalLMLoss
+        #     loss = self.loss_function(logits=lm_logits, labels=labels[:, -1:], vocab_size=self.config.vocab_size)#, **kwargs)
+    
+            
         
         if not return_dict:
             outputs = (lm_logits,) + outputs[1:]
@@ -632,11 +818,12 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        compute_loss: Optional[bool] = False
     ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        if labels is not None:
+        if labels is not None and not compute_loss:
             if not self.training:
                 logger.warning_once(
                     "`using forward method with labels but model is in eval mode. Setting model.train() and calling model.memorize"
@@ -657,10 +844,1036 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             #head_mask=head_mask,
             inputs_embeds=inputs_embeds,
+            labels=labels,
             use_cache=use_cache,
             output_hidden_token=output_hidden_token,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position
         )
+    
+    # def forward_with_loss(
+    #     self,
+    #     batch_inputs,
+    #     return_dict: Optional[bool] = None,
+    #     # tokenizer = None
+    #     compute_accuracy=False,
+    # ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
+
+    #     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    #     # batch_encoding = tokenizer.get_text_batch_encoding_for_loss(text=text_batch)
+    #     input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
+
+    #     logits_list = list()
+    #     outputs = None 
+    #     lm_logits = None
+    #     for i in range(self.memo.chunk_length, labels.shape[1]):
+    #         if outputs is not None:
+    #             del outputs
+    #             torch.cuda.empty_cache()
+    #         current_batch = dict(
+    #             input_ids=input_ids[:, i-self.memo.chunk_length:i],
+    #             labels=labels[:, i-self.memo.chunk_length:i]
+    #         )
+    #         outputs = self.forward(
+    #             input_ids=current_batch['input_ids'],
+    #             labels=current_batch['labels'],
+    #             return_dict=return_dict,
+    #             compute_loss=True
+    #         )
+    #         logits = outputs.logits 
+    #         if lm_logits is None:
+    #             lm_logits = logits
+    #         else: 
+    #             lm_logits = torch.cat([lm_logits, logits], dim=1)
+    #         del logits
+    #         del current_batch
+    #         # logits_list.append(logits)
+        
+    #     # lm_logits = torch.cat(logits_list, dim=1)
+    #     _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
+    #     loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
+    #     argmax = torch.argmax(lm_logits, dim=-1)
+
+    #     return MeMoCausalLMOutputWithPast(
+    #         loss=loss,
+    #         logits=lm_logits,
+    #         past_key_values=outputs.past_key_values,
+    #         hidden_states=outputs.hidden_states,
+    #         hidden_tokens=outputs.hidden_tokens,
+    #     )
+
+
+    def forward_with_loss(
+        self,
+        batch_inputs,
+        return_dict: Optional[bool] = None,
+        # tokenizer = None
+        compute_accuracy=False,
+        starting_point=9, #2
+        tokenizer=None
+    ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
+
+        starting_point = max(2, starting_point) 
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # batch_encoding = tokenizer.get_text_batch_encoding_for_loss(text=text_batch)
+        input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
+
+        logits_list = list()
+        outputs = None 
+        lm_logits = None
+
+        tot_correct_tokens = None 
+        total_tokens = None
+
+        total_loss = None
+        total_nll_sum = 0.0  # Sum of negative log likelihoods (for perplexity)
+        num_tokens_predicted = 0  # Total number of tokens predicted
+
+        # Per-token statistics: {token_id: {'target_count': int, 'correct_count': int}}
+        token_stats = {}
+        
+        # Track padding tokens for masking analysis
+        pad_token_id = getattr(self.config, 'pad_token_id', 0)
+        padding_token_analysis = {
+            'padding_tokens_masked': 0,      # Padding tokens with label == -100
+            'padding_tokens_not_masked': 0,  # Padding tokens with label != -100
+            'padding_tokens_correct': 0      # Padding tokens that were correctly predicted (if not masked)
+        }
+
+        debug_predictions = list()
+
+        if self.memo.chunk_length+starting_point >= labels.shape[1]:
+            return None, None, None 
+
+        for i in range(self.memo.chunk_length+starting_point, labels.shape[1]):
+            if outputs is not None:
+                del outputs
+                torch.cuda.empty_cache()
+            current_batch = dict(
+                input_ids=input_ids[:, i-self.memo.chunk_length:i],
+                # labels=labels[:, i-self.memo.chunk_length:i]
+                labels=labels[:, i-1:i]
+            )
+            outputs = self.forward(
+                input_ids=current_batch['input_ids'],
+                labels=current_batch['labels'],
+                return_dict=return_dict,
+                compute_loss=True
+            )
+            logits = outputs.logits 
+            # if lm_logits is None:
+            #     lm_logits = logits
+            # else: 
+            #     lm_logits = torch.cat([lm_logits, logits], dim=1)
+            # del logits
+            # del current_batch
+            # logits_list.append(logits)
+
+            # lm_logits = (logits + 10) * 1000 # scale up logits to make them more confident when applying the softmax
+            lm_logits = logits.detach()  # Detach logits to prevent gradients from flowing back through them during loss computation
+
+            # mask out all the logits whose scores are outside the 50 best tokens (top-k filtering), in order to consider only the top-k tokens for the loss computation using the softmax 
+            top_k = torch.topk(lm_logits, k=50, dim=-1)
+            top_k_indices = top_k.indices
+            top_k_values = top_k.values
+            mask = torch.full_like(lm_logits, -12.0) #float('-inf'))
+            mask.scatter_(dim=-1, index=top_k_indices, src=top_k_values)
+            lm_logits = mask * 10 #lm_logits + mask
+
+        
+            # lm_logits = torch.cat(logits_list, dim=1)
+            # _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)
+            # loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
+            # argmax = torch.argmax(lm_logits, dim=-1)
+            _labels = current_batch['labels'].contiguous().to(self.memo.device)
+            loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size)#, shift_labels=_labels)
+            
+            ## For debugging and analysis: compute argmax and softmax values for the current batch
+            argmax = torch.argmax(lm_logits, dim=-1)
+            argmax_value = torch.max(lm_logits, dim=-1)
+            top_k = torch.topk(lm_logits, k=5, dim=-1)
+            
+            _lm_logits_softmax = torch.nn.functional.softmax(lm_logits, dim=-1)
+            argmax_soft = torch.argmax(_lm_logits_softmax, dim=-1)
+            argmax_value_soft = torch.max(_lm_logits_softmax, dim=-1)
+            top_k_softmax = torch.topk(_lm_logits_softmax, k=5, dim=-1)
+            
+            # get the probability of the expected label declared in _labels from _lm_logit_softmax
+            expected_label_prob = torch.gather(_lm_logits_softmax, dim=-1, index=_labels.unsqueeze(-1)).squeeze(-1)
+            expected_label_score = torch.gather(lm_logits, dim=-1, index=_labels.unsqueeze(-1)).squeeze(-1)
+            # batch_debug_info = dict()
+            if tokenizer is not None:
+                # decode the predicted token ids and expected token ids for the current batch
+                pred_tokens = tokenizer.batch_decode(argmax)
+                expected_tokens = tokenizer.batch_decode(_labels)
+                top_k_tokens_list = top_k.indices.reshape(top_k.indices.shape[0], -1).cpu().numpy().tolist()
+                top_k_predicted_tokens = [
+                    tokenizer.convert_ids_to_tokens(_top_k_tokens_list)
+                    for _top_k_tokens_list in top_k_tokens_list
+                ]
+                top_k_scores = top_k.values.reshape(top_k.values.shape[0], -1)
+                top_k_softmax_scores = top_k_softmax.values.reshape(top_k_softmax.values.shape[0], -1)
+                batch_debug_info = {
+                    'sequence_index': i,
+                    'input_sequence': tokenizer.batch_decode(current_batch['input_ids'], skip_special_tokens=True),
+                    'pred_tokens': pred_tokens,
+                    'pred_score': argmax_value.values.cpu().numpy().tolist(),
+                    'pred_score_softmax': argmax_value_soft.values.cpu().numpy().tolist(),
+                    'expected_tokens': expected_tokens,
+                    'expected_label_prob': expected_label_prob.cpu().numpy().tolist(),
+                    'expected_label_score': expected_label_score.cpu().numpy().tolist(),
+                    'top_predicted_tokens': top_k_predicted_tokens,
+                    'top_predicted_token_scores': top_k_scores.cpu().numpy().tolist(),
+                    'top_predicted_tokens_softmax': top_k_softmax_scores.cpu().numpy().tolist(),
+
+                    'vocab_distribution_score_sum': lm_logits.sum(dim=-1).cpu().numpy().tolist(),
+                    'vocab_distribution_score_mean': lm_logits.mean(dim=-1).cpu().numpy().tolist(),
+                    'vocab_distribution_score_sum_softmax': _lm_logits_softmax.sum(dim=-1).cpu().numpy().tolist(),
+                    'vocab_distribution_score_mean_softmax': _lm_logits_softmax.mean(dim=-1).cpu().numpy().tolist(),
+                    'vocab_distrib_min_score': lm_logits.min(dim=-1).values.cpu().numpy().tolist(),
+                    'vocab_distrib_min_score_softmax': _lm_logits_softmax.min(dim=-1).values.cpu().numpy().tolist(),
+
+                    'exp_vocab_distribution_score_sum': torch.exp(lm_logits).sum(dim=-1).cpu().numpy().tolist(),
+                    'exp_vocab_distribution_score_mean': torch.exp(lm_logits).mean(dim=-1).cpu().numpy().tolist(),
+                    'exp_vocab_distrib_min_score': torch.exp(lm_logits).min(dim=-1).values.cpu().numpy().tolist(),
+                    'exp_vocab_distrib_max_score': torch.exp(lm_logits).max(dim=-1).values.cpu().numpy().tolist(),
+
+                    'loss': loss.detach().cpu().numpy().tolist(),
+                }
+                # check all the fields of the batch_debug_info and convert inf or -inf to a string for better readability in the logs
+                # for key, value in batch_debug_info.items():
+                #     if isinstance(value, list):
+                #         batch_debug_info[key] = [v if not (isinstance(v, float) and (v == float('inf') or v == float('-inf'))) else str(v) for v in value]
+                #     elif isinstance(value, float) and (value == float('inf') or value == float('-inf')):
+                #         batch_debug_info[key] = str(value)
+                for key, value in batch_debug_info.items():
+                    if isinstance(value, list):
+                        if isinstance(value[0], list):
+                            batch_debug_info[key] = [[str(v) if str(v) in ['inf', '-inf'] else v for v in sublist] for sublist in value]
+                        else:
+                            batch_debug_info[key] = [str(v) if str(v) in ['inf', '-inf'] else v for v in value]
+                    elif isinstance(value, float) and (str(value) in ['inf', '-inf']):
+                        batch_debug_info[key] = str(value)
+                debug_predictions.append(batch_debug_info)
+                # if the loss is infinte for the current batch, print the debug information
+                # if str(loss.detach().cpu().numpy().item()) in ['inf', '-inf']:
+                #     print(f"Batch index: {i}")
+                #     print(batch_debug_info)
+
+                # print(f"Predicted tokens: {pred_tokens}")
+                # print(f"Expected tokens: {expected_tokens}")
+                # print(f"Expected token probabilities: {expected_label_prob}")
+                # print(f"Top 5 predicted tokens: {tokenizer.batch_decode(top_k.indices)}")
+                # print(f"Top 5 predicted token probabilities: {top_k.values}")
+
+
+            batch_size = _labels.shape[0]
+            num_valid_tokens_in_batch = (_labels != -100).sum().item()
+            
+            # Accumulate loss: assuming loss_function returns mean loss across valid tokens
+            # Convert mean to sum by multiplying by number of valid tokens
+            if total_loss is None:
+                total_loss = loss * num_valid_tokens_in_batch
+            else:
+                total_loss += loss * num_valid_tokens_in_batch
+            
+            # Accumulate for perplexity: loss is already mean NLL per token
+            # Multiply by number of valid tokens to get sum of NLL for this batch
+            total_nll_sum += loss.detach() * num_valid_tokens_in_batch
+            num_tokens_predicted += num_valid_tokens_in_batch
+
+            if compute_accuracy:
+                # argmax for selecting most probable labels
+                pred = torch.max(lm_logits, dim=-1)
+                p_indices, p_values = pred.indices, pred.values
+                
+                # create bitmask for correctly predicted labels
+                correct_tokens = (p_indices == _labels).type(torch.int)
+                
+                # Analyze per-token statistics (before masking -100 tokens)
+                valid_mask = _labels != -100  # Tokens that are not masked
+                
+                # Flatten tensors for per-token analysis
+                flat_labels = _labels.flatten()
+                flat_correct = correct_tokens.flatten()
+                flat_valid = valid_mask.flatten()
+                
+                for token_id in torch.unique(flat_labels):
+                    token_id = token_id.item()
+                    if token_id == -100:
+                        continue
+                    
+                    # Find all occurrences of this token
+                    token_mask = (flat_labels == token_id)
+                    
+                    if token_id not in token_stats:
+                        token_stats[token_id] = {'target_count': 0, 'correct_count': 0}
+                    
+                    # Count how many times this token appears as target
+                    token_count = torch.sum(token_mask).item()
+                    token_stats[token_id]['target_count'] += token_count
+                    
+                    # Count how many times it was correctly predicted
+                    correct_for_token = torch.sum(flat_correct[token_mask]).item()
+                    token_stats[token_id]['correct_count'] += correct_for_token
+                
+                # Analyze padding tokens
+                if pad_token_id is not None:
+                    padding_mask = (flat_labels == pad_token_id)
+                    masked_padding = torch.sum((flat_labels == pad_token_id) & (_labels.flatten() == -100)).item()
+                    not_masked_padding = torch.sum((flat_labels == pad_token_id) & (_labels.flatten() != -100)).item()
+                    
+                    padding_token_analysis['padding_tokens_masked'] += masked_padding
+                    padding_token_analysis['padding_tokens_not_masked'] += not_masked_padding
+                    
+                    # Check if any unmasked padding tokens were correctly predicted
+                    if not_masked_padding > 0:
+                        unmasked_padding_correct = torch.sum(
+                            flat_correct[padding_mask & flat_valid]
+                        ).item()
+                        padding_token_analysis['padding_tokens_correct'] += unmasked_padding_correct
+                
+                # set bitmask entries to 0 for -100 tokens
+                correct_tokens[_labels == -100] = 0
+                correct_tokens = torch.sum(correct_tokens)
+                if tot_correct_tokens is None:
+                    tot_correct_tokens = correct_tokens
+                else:
+                    tot_correct_tokens += correct_tokens
+
+                # count how many tokens != -100 in labels
+                tot_tokens = torch.sum((_labels != -100).type(torch.int))
+                if total_tokens is None:
+                    total_tokens = tot_tokens
+                else:
+                    total_tokens += tot_tokens
+            del current_batch
+            del lm_logits 
+            del logits 
+
+        # # convert token_stats to list of dicts
+        # token_stats = [
+        #     {
+        #         'token_id': token_id,
+        #         'target_count': stats['target_count'],
+        #         'correct_count': stats['correct_count'],
+        #         #'accuracy': (stats['correct_count'] / stats['target_count']) if stats['target_count'] > 0 else 0.0
+        #     }
+        #     for token_id, stats in token_stats.items()
+        # ]
+        # # create two list of dictionaries from token_stats, one sorted by correct_count and one sorted by accuracy, and keep the top max_token_distrib_rank tokens for each list
+        # token_stats_by_correct = sorted(token_stats, key=lambda x: x['correct_count'], reverse=True)[:max_token_distrib_rank]
+        # token_stats_by_target = sorted(token_stats, key=lambda x: x['correct_count']/x['target_count'], reverse=True)[:max_token_distrib_rank]
+        
+        # compute accuracy, and return dictionary with these fields
+        accuracy_results = dict(
+            accuracy=(tot_correct_tokens/total_tokens).detach().cpu().item(),
+            correct_tokens=tot_correct_tokens.detach().cpu().item(),
+            tot_tokens=total_tokens.detach().cpu().item(),
+            token_stats=token_stats,
+            padding_analysis=padding_token_analysis['padding_tokens_correct'],
+        ) if compute_accuracy else None
+        
+        # Compute perplexity: exp(average NLL)
+        # average NLL = total_nll_sum / num_tokens_predicted
+        if num_tokens_predicted > 0:
+            avg_nll = total_nll_sum / num_tokens_predicted
+            perplexity_value = torch.exp(avg_nll).detach().cpu().item()
+        else:
+            perplexity_value = 0.0
+        
+        # Add perplexity to the results
+        if accuracy_results is not None:
+            accuracy_results['perplexity'] = perplexity_value
+            accuracy_results['avg_nll'] = (total_nll_sum / num_tokens_predicted).detach().cpu().item() if num_tokens_predicted > 0 else 0.0
+            accuracy_results['num_tokens'] = num_tokens_predicted
+        else:
+            accuracy_results = dict(
+                perplexity=perplexity_value,
+                avg_nll=(total_nll_sum / num_tokens_predicted).detach().cpu().item() if num_tokens_predicted > 0 else 0.0,
+                num_tokens=num_tokens_predicted
+            )
+        
+        batch_debug = dict(
+            ppl=accuracy_results['perplexity'],
+            avg_nll=accuracy_results['avg_nll'],
+            num_tokens=accuracy_results['num_tokens'],
+            accuracy=accuracy_results['accuracy'] if compute_accuracy else None,
+            correct_tokens=accuracy_results['correct_tokens'] if compute_accuracy else None,
+            total_tokens=accuracy_results['tot_tokens'] if compute_accuracy else None,
+            predictions=debug_predictions
+        )
+
+        return MeMoCausalLMOutputWithPast(
+            loss=total_loss,
+            logits=None, #lm_logits,
+            past_key_values=None, #outputs.past_key_values,
+            hidden_states=None, #outputs.hidden_states,
+            hidden_tokens=None, #outputs.hidden_tokens,
+        ), accuracy_results, batch_debug
+
+
+    def forward_with_loss_unfold_v1( ####### ESR implmented and tested
+            self,
+            batch_inputs,
+            return_dict: Optional[bool] = None,
+            compute_accuracy=False,
+            starting_point=9,
+            tokenizer=None,
+            window_batch_size: int = 16,  # NEW: number of sliding-window positions batched into a single forward() call
+        ) -> Optional[Union[Tuple[torch.Tensor], "MeMoCausalLMOutputWithPast"]]:
+        """
+        Parallelized version of forward_with_loss.
+    
+        The original implementation called self.forward() once per target token
+        position i, each time re-running the full chunk_length-token window through
+        the model. That's an embarrassingly parallel workload (each window is an
+        independent input -- `outputs` is deleted every iteration and nothing like
+        past_key_values or memory state is threaded between calls), so instead of
+        looping token-by-token, this groups `window_batch_size` windows together
+        along the batch dimension and does one forward() call per group.
+    
+        IMPORTANT: this is only equivalent to the original loop if self.forward()
+        (and whatever self.memo does internally) is a pure function of
+        (input_ids, labels) for a given window -- i.e. it does not mutate any
+        persistent/recurrent state that depends on windows being visited in strict
+        left-to-right order. Please double check that assumption against your
+        `self.memo` implementation before trusting these results in place of the
+        original loop.
+    
+        This does NOT reduce total FLOPs (each window still reprocesses
+        chunk_length tokens from scratch, exactly like before) -- it reduces the
+        number of separate forward() calls, trading many tiny serialized calls for
+        fewer, larger batched ones. That's usually where the real wall-clock win
+        comes from (kernel-launch overhead, GPU underutilization from batch size 1,
+        per-call autograd graph setup). Tune `window_batch_size` for your GPU
+        memory budget: larger = fewer calls = faster, until you run out of memory.
+        """
+    
+        starting_point = max(2, starting_point)
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+    
+        input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
+    
+        chunk_length = self.memo.chunk_length
+        batch_size, seq_len = input_ids.shape
+    
+        start = chunk_length + starting_point
+        if start >= seq_len:
+            return None, None, None
+    
+        # ---- Build every sliding window up front -----------------------------------
+        # windows_all[:, j, :] == input_ids[:, j : j + chunk_length]
+        windows_all = input_ids.unfold(dimension=1, size=chunk_length, step=1)  # (B, W_total, chunk_length)
+    
+        w_lo = starting_point           # j such that i = j + chunk_length == start
+        w_hi = seq_len - chunk_length   # j such that i = j + chunk_length == seq_len (exclusive upper bound)
+        windows = windows_all[:, w_lo:w_hi, :]                 # (B, num_windows, chunk_length)
+    
+        label_lo = start - 1
+        label_hi = seq_len - 1
+        window_labels = labels[:, label_lo:label_hi]           # (B, num_windows), same as labels[:, i-1] for each i
+    
+        num_windows = window_labels.shape[1]
+        assert num_windows == windows.shape[1]
+    
+        # original loop variable i, per window index j (0-based within `windows`)
+        window_i_values = list(range(start, seq_len))
+    
+        tot_correct_tokens = None
+        total_tokens = None
+    
+        total_loss = None
+        total_nll_sum = 0.0
+        num_tokens_predicted = 0
+    
+        # Per-token statistics: {token_id: {'target_count': int, 'correct_count': int}}
+        token_stats = {}
+    
+        pad_token_id = getattr(self.config, 'pad_token_id', 0)
+        padding_token_analysis = {
+            'padding_tokens_masked': 0,
+            'padding_tokens_not_masked': 0,
+            'padding_tokens_correct': 0
+        }
+    
+        debug_predictions = list()
+    
+        for w_start in range(0, num_windows, window_batch_size):
+            w_end = min(w_start + window_batch_size, num_windows)
+            w = w_end - w_start
+    
+            cur_windows = windows[:, w_start:w_end, :]     # (B, w, chunk_length)
+            cur_labels = window_labels[:, w_start:w_end]    # (B, w)
+    
+            # fold (batch, window) into one big batch dimension for a single forward() call
+            # NOTE: reshape order is row-major, so flat index = b * w + j -- kept consistent
+            # below whenever we need to regroup back to (batch, window).
+            flat_input_ids = cur_windows.reshape(batch_size * w, chunk_length)
+            flat_labels = cur_labels.reshape(batch_size * w, 1)
+    
+            outputs = self.forward(
+                input_ids=flat_input_ids,
+                labels=flat_labels,
+                return_dict=return_dict,
+                compute_loss=True
+            )
+            logits = outputs.logits
+            lm_logits = logits.detach()  # detach to prevent gradients flowing back through this copy
+    
+            # top-k filtering (same as original): keep only the top-50 logits per position
+            top_k = torch.topk(lm_logits, k=50, dim=-1)
+            mask = torch.full_like(lm_logits, -12.0)
+            mask.scatter_(dim=-1, index=top_k.indices, src=top_k.values)
+            lm_logits = mask * 10
+    
+            _labels = flat_labels.contiguous().to(self.memo.device)
+            loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size)
+    
+            argmax = torch.argmax(lm_logits, dim=-1)
+            argmax_value = torch.max(lm_logits, dim=-1)
+            top_k5 = torch.topk(lm_logits, k=5, dim=-1)
+    
+            _lm_logits_softmax = torch.nn.functional.softmax(lm_logits, dim=-1)
+            argmax_value_soft = torch.max(_lm_logits_softmax, dim=-1)
+            top_k_softmax = torch.topk(_lm_logits_softmax, k=5, dim=-1)
+    
+            expected_label_prob = torch.gather(_lm_logits_softmax, dim=-1, index=_labels.unsqueeze(-1)).squeeze(-1)
+            expected_label_score = torch.gather(lm_logits, dim=-1, index=_labels.unsqueeze(-1)).squeeze(-1)
+    
+            if tokenizer is not None:
+                # Reshape everything back to (B, w, ...) so we can emit one debug dict
+                # per original position i, in the same shape the un-parallelized loop produced.
+                pred_tokens_flat = tokenizer.batch_decode(argmax)
+                expected_tokens_flat = tokenizer.batch_decode(_labels)
+                input_seq_flat = tokenizer.batch_decode(flat_input_ids, skip_special_tokens=True)
+    
+                def _regroup(flat_list):
+                    return [flat_list[b * w:(b + 1) * w] for b in range(batch_size)]
+    
+                pred_tokens_grouped = _regroup(pred_tokens_flat)
+                expected_tokens_grouped = _regroup(expected_tokens_flat)
+                input_seq_grouped = _regroup(input_seq_flat)
+    
+                pred_score = argmax_value.values.reshape(batch_size, w).cpu().numpy().tolist()
+                pred_score_softmax = argmax_value_soft.values.reshape(batch_size, w).cpu().numpy().tolist()
+                expected_label_prob_g = expected_label_prob.reshape(batch_size, w).cpu().numpy().tolist()
+                expected_label_score_g = expected_label_score.reshape(batch_size, w).cpu().numpy().tolist()
+                loss_scalar = loss.detach().cpu().numpy().tolist()  # mean loss over this whole micro-batch
+    
+                top_k_tokens_list = top_k5.indices.reshape(batch_size, w, -1).cpu().numpy().tolist()
+                top_k_scores = top_k5.values.reshape(batch_size, w, -1).cpu().numpy().tolist()
+                top_k_softmax_scores = top_k_softmax.values.reshape(batch_size, w, -1).cpu().numpy().tolist()
+    
+                vocab_sum = lm_logits.reshape(batch_size, w, -1).sum(dim=-1).cpu().numpy().tolist()
+                vocab_mean = lm_logits.reshape(batch_size, w, -1).mean(dim=-1).cpu().numpy().tolist()
+                vocab_sum_soft = _lm_logits_softmax.reshape(batch_size, w, -1).sum(dim=-1).cpu().numpy().tolist()
+                vocab_mean_soft = _lm_logits_softmax.reshape(batch_size, w, -1).mean(dim=-1).cpu().numpy().tolist()
+                vocab_min = lm_logits.reshape(batch_size, w, -1).min(dim=-1).values.cpu().numpy().tolist()
+                vocab_min_soft = _lm_logits_softmax.reshape(batch_size, w, -1).min(dim=-1).values.cpu().numpy().tolist()
+    
+                exp_lm_logits = torch.exp(lm_logits).reshape(batch_size, w, -1)
+                exp_sum = exp_lm_logits.sum(dim=-1).cpu().numpy().tolist()
+                exp_mean = exp_lm_logits.mean(dim=-1).cpu().numpy().tolist()
+                exp_min = exp_lm_logits.min(dim=-1).values.cpu().numpy().tolist()
+                exp_max = exp_lm_logits.max(dim=-1).values.cpu().numpy().tolist()
+    
+                for local_j in range(w):
+                    i_value = window_i_values[w_start + local_j]
+                    batch_debug_info = {
+                        'sequence_index': i_value,
+                        'input_sequence': [input_seq_grouped[b][local_j] for b in range(batch_size)],
+                        'pred_tokens': [pred_tokens_grouped[b][local_j] for b in range(batch_size)],
+                        'pred_score': [pred_score[b][local_j] for b in range(batch_size)],
+                        'pred_score_softmax': [pred_score_softmax[b][local_j] for b in range(batch_size)],
+                        'expected_tokens': [expected_tokens_grouped[b][local_j] for b in range(batch_size)],
+                        'expected_label_prob': [expected_label_prob_g[b][local_j] for b in range(batch_size)],
+                        'expected_label_score': [expected_label_score_g[b][local_j] for b in range(batch_size)],
+                        'top_predicted_tokens': [
+                            tokenizer.convert_ids_to_tokens(top_k_tokens_list[b][local_j])
+                            for b in range(batch_size)
+                        ],
+                        'top_predicted_token_scores': [top_k_scores[b][local_j] for b in range(batch_size)],
+                        'top_predicted_tokens_softmax': [top_k_softmax_scores[b][local_j] for b in range(batch_size)],
+    
+                        'vocab_distribution_score_sum': [vocab_sum[b][local_j] for b in range(batch_size)],
+                        'vocab_distribution_score_mean': [vocab_mean[b][local_j] for b in range(batch_size)],
+                        'vocab_distribution_score_sum_softmax': [vocab_sum_soft[b][local_j] for b in range(batch_size)],
+                        'vocab_distribution_score_mean_softmax': [vocab_mean_soft[b][local_j] for b in range(batch_size)],
+                        'vocab_distrib_min_score': [vocab_min[b][local_j] for b in range(batch_size)],
+                        'vocab_distrib_min_score_softmax': [vocab_min_soft[b][local_j] for b in range(batch_size)],
+    
+                        'exp_vocab_distribution_score_sum': [exp_sum[b][local_j] for b in range(batch_size)],
+                        'exp_vocab_distribution_score_mean': [exp_mean[b][local_j] for b in range(batch_size)],
+                        'exp_vocab_distrib_min_score': [exp_min[b][local_j] for b in range(batch_size)],
+                        'exp_vocab_distrib_max_score': [exp_max[b][local_j] for b in range(batch_size)],
+    
+                        # NOTE: unlike the original (which had a true per-position loss),
+                        # this is the mean loss over the whole window_batch_size micro-batch,
+                        # since loss is now computed once per group rather than once per position.
+                        'loss': loss_scalar,
+                    }
+                    for key, value in batch_debug_info.items():
+                        if isinstance(value, list):
+                            if len(value) > 0 and isinstance(value[0], list):
+                                batch_debug_info[key] = [[str(v) if str(v) in ['inf', '-inf'] else v for v in sublist] for sublist in value]
+                            else:
+                                batch_debug_info[key] = [str(v) if str(v) in ['inf', '-inf'] else v for v in value]
+                        elif isinstance(value, float) and (str(value) in ['inf', '-inf']):
+                            batch_debug_info[key] = str(value)
+                    debug_predictions.append(batch_debug_info)
+    
+            num_valid_tokens_in_batch = (_labels != -100).sum().item()
+    
+            if total_loss is None:
+                total_loss = loss * num_valid_tokens_in_batch
+            else:
+                total_loss += loss * num_valid_tokens_in_batch
+    
+            total_nll_sum += loss.detach() * num_valid_tokens_in_batch
+            num_tokens_predicted += num_valid_tokens_in_batch
+    
+            if compute_accuracy:
+                pred = torch.max(lm_logits, dim=-1)
+                p_indices = pred.indices
+    
+                correct_tokens = (p_indices == _labels).type(torch.int)
+                valid_mask = _labels != -100
+    
+                flat_labels_t = _labels.flatten()
+                flat_correct = correct_tokens.flatten()
+                flat_valid = valid_mask.flatten()
+    
+                for token_id in torch.unique(flat_labels_t):
+                    token_id = token_id.item()
+                    if token_id == -100:
+                        continue
+                    token_mask = (flat_labels_t == token_id)
+                    if token_id not in token_stats:
+                        token_stats[token_id] = {'target_count': 0, 'correct_count': 0}
+                    token_count = torch.sum(token_mask).item()
+                    token_stats[token_id]['target_count'] += token_count
+                    correct_for_token = torch.sum(flat_correct[token_mask]).item()
+                    token_stats[token_id]['correct_count'] += correct_for_token
+    
+                if pad_token_id is not None:
+                    padding_mask = (flat_labels_t == pad_token_id)
+                    masked_padding = torch.sum((flat_labels_t == pad_token_id) & (_labels.flatten() == -100)).item()
+                    not_masked_padding = torch.sum((flat_labels_t == pad_token_id) & (_labels.flatten() != -100)).item()
+    
+                    padding_token_analysis['padding_tokens_masked'] += masked_padding
+                    padding_token_analysis['padding_tokens_not_masked'] += not_masked_padding
+    
+                    if not_masked_padding > 0:
+                        unmasked_padding_correct = torch.sum(flat_correct[padding_mask & flat_valid]).item()
+                        padding_token_analysis['padding_tokens_correct'] += unmasked_padding_correct
+    
+                correct_tokens[_labels == -100] = 0
+                correct_tokens = torch.sum(correct_tokens)
+                tot_correct_tokens = correct_tokens if tot_correct_tokens is None else tot_correct_tokens + correct_tokens
+    
+                tot_tokens = torch.sum((_labels != -100).type(torch.int))
+                total_tokens = tot_tokens if total_tokens is None else total_tokens + tot_tokens
+    
+            del outputs, logits, lm_logits, flat_input_ids, flat_labels, _labels
+            torch.cuda.empty_cache()
+    
+        accuracy_results = dict(
+            accuracy=(tot_correct_tokens / total_tokens).detach().cpu().item(),
+            correct_tokens=tot_correct_tokens.detach().cpu().item(),
+            tot_tokens=total_tokens.detach().cpu().item(),
+            token_stats=token_stats,
+            padding_analysis=padding_token_analysis['padding_tokens_correct'],
+        ) if compute_accuracy else None
+    
+        if num_tokens_predicted > 0:
+            avg_nll = total_nll_sum / num_tokens_predicted
+            perplexity_value = torch.exp(avg_nll).detach().cpu().item()
+        else:
+            perplexity_value = 0.0
+    
+        if accuracy_results is not None:
+            accuracy_results['perplexity'] = perplexity_value
+            accuracy_results['avg_nll'] = (total_nll_sum / num_tokens_predicted).detach().cpu().item() if num_tokens_predicted > 0 else 0.0
+            accuracy_results['num_tokens'] = num_tokens_predicted
+        else:
+            accuracy_results = dict(
+                perplexity=perplexity_value,
+                avg_nll=(total_nll_sum / num_tokens_predicted).detach().cpu().item() if num_tokens_predicted > 0 else 0.0,
+                num_tokens=num_tokens_predicted
+            )
+    
+        batch_debug = dict(
+            ppl=accuracy_results['perplexity'],
+            avg_nll=accuracy_results['avg_nll'],
+            num_tokens=accuracy_results['num_tokens'],
+            accuracy=accuracy_results['accuracy'] if compute_accuracy else None,
+            correct_tokens=accuracy_results['correct_tokens'] if compute_accuracy else None,
+            total_tokens=accuracy_results['tot_tokens'] if compute_accuracy else None,
+            predictions=debug_predictions
+        )
+    
+        return MeMoCausalLMOutputWithPast(
+            loss=total_loss,
+            logits=None,
+            past_key_values=None,
+            hidden_states=None,
+            hidden_tokens=None,
+        ), accuracy_results, batch_debug
+
+
+
+    ### ESR 2026-09-08
+    def forward_with_loss_simple(
+        self,
+        batch_inputs,
+        return_dict: Optional[bool] = None,
+        compute_accuracy=False,
+        starting_point=9,
+        tokenizer=None,
+    ) -> Optional[Union[Tuple[torch.Tensor], "MeMoCausalLMOutputWithPast"]]:
+        """
+        Simplified forward_with_loss for models whose forward() already scores an
+        entire sequence in one call.
+     
+        Given batch_inputs['input_ids'] and batch_inputs['labels'], both (B, seq_len),
+        a single self.forward(input_ids=input_ids, labels=labels) call returns
+        outputs.logits of shape (B, seq_len, vocab_size), where logits[:, p, :] is
+        the model's prediction distribution for the token at position p, aligned
+        directly with labels[:, p] (no windowing, no chunk_length, no shifting).
+     
+        That means the entire per-token forward-pass loop from the windowed version
+        is unnecessary: there's nothing left to parallelize across calls, because
+        there's only one call. What's left is just vectorized bookkeeping (loss,
+        accuracy, token_stats, padding analysis, perplexity), computed once over
+        the full (B, seq_len, vocab) tensor instead of accumulated across many
+        micro-batches -- so all the per-iteration accumulator logic (total_loss +=,
+        total_nll_sum +=, target_counts_total +=, ...) collapses into single
+        (non-accumulating) computations.
+     
+        `starting_point` still lets you exclude the first N positions from the
+        loss/accuracy/perplexity computation (e.g. if the model's predictions are
+        unreliable before it has seen enough context), but no longer has anything
+        to do with a context-window size -- it's just an index offset now.
+     
+        -100 in labels still marks positions to exclude from every statistic,
+        exactly as before.
+        """
+        starting_point = max(2, starting_point)
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+     
+        input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
+     
+        vocab_size = self.config.vocab_size
+        batch_size, seq_len = input_ids.shape
+     
+        if starting_point >= seq_len:
+            return None, None, None
+     
+        # ---- Single forward pass over the whole sequence ----------------------------
+        outputs = self.forward(
+            input_ids=input_ids,
+            labels=labels,
+            return_dict=return_dict,
+            compute_loss=True
+        )
+        logits = outputs.logits  # (B, seq_len, vocab_size)
+        lm_logits = logits.detach()
+     
+        if starting_point > 0:
+            lm_logits = lm_logits[:, starting_point:, :]
+            labels = labels[:, starting_point:]
+     
+        # positions kept, expressed as indices into the *original* sequence -- used
+        # only for the 'sequence_index' field in the debug output.
+        kept_positions = list(range(starting_point, seq_len))
+     
+        # top-k filtering (same as original): keep only the top-50 logits per position
+        top_k = torch.topk(lm_logits, k=50, dim=-1)
+        mask = torch.full_like(lm_logits, -12.0)
+        mask.scatter_(dim=-1, index=top_k.indices, src=top_k.values)
+        lm_logits = mask * 10
+     
+        _labels = labels.contiguous().to(self.memo.device)
+        loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=vocab_size)
+     
+        valid_mask = _labels != -100
+        flat_labels_t = _labels.flatten()
+        flat_valid = valid_mask.flatten()
+     
+        num_valid_tokens = flat_valid.sum().item()
+     
+        total_loss = loss * num_valid_tokens
+        total_nll_sum = loss.detach() * num_valid_tokens
+        num_tokens_predicted = num_valid_tokens
+     
+        need_top1 = compute_accuracy or (tokenizer is not None)
+        if need_top1:
+            top1 = torch.max(lm_logits, dim=-1)
+            argmax = top1.indices          # (B, kept_len)
+            argmax_value = top1.values     # (B, kept_len)
+        else:
+            argmax = None
+            argmax_value = None
+     
+        # ---- Accuracy / token_stats / padding analysis, vectorized, one shot -------
+        accuracy_results = None
+        if compute_accuracy:
+            flat_correct = (argmax == _labels).flatten()  # bool
+     
+            valid_labels = flat_labels_t[flat_valid]
+            valid_correct = flat_correct[flat_valid]
+     
+            target_counts = torch.bincount(valid_labels, minlength=vocab_size)
+            correct_counts = torch.bincount(valid_labels[valid_correct], minlength=vocab_size)
+            nonzero_ids = torch.nonzero(target_counts, as_tuple=True)[0].tolist()
+            token_stats = {
+                tid: {
+                    'target_count': target_counts[tid].item(),
+                    'correct_count': correct_counts[tid].item(),
+                }
+                for tid in nonzero_ids
+            }
+     
+            pad_token_id = getattr(self.config, 'pad_token_id', 0)
+            is_pad = flat_labels_t == pad_token_id
+            padding_tokens_masked = torch.sum(is_pad & ~flat_valid).item()
+            padding_tokens_not_masked = torch.sum(is_pad & flat_valid).item()
+            padding_tokens_correct = (
+                torch.sum(flat_correct & is_pad & flat_valid).item()
+                if padding_tokens_not_masked > 0 else 0
+            )
+     
+            tot_correct_tokens = valid_correct.sum().item()
+            tot_tokens = int(num_valid_tokens)
+     
+            accuracy_results = dict(
+                accuracy=(tot_correct_tokens / tot_tokens) if tot_tokens > 0 else 0.0,
+                correct_tokens=tot_correct_tokens,
+                tot_tokens=tot_tokens,
+                token_stats=token_stats,
+                padding_analysis=padding_tokens_correct,
+            )
+            # kept for parity with the original dict shape, in case callers read these:
+            accuracy_results['padding_tokens_masked'] = padding_tokens_masked
+            accuracy_results['padding_tokens_not_masked'] = padding_tokens_not_masked
+     
+        # ---- Perplexity ---------------------------------------------------------------
+        if num_tokens_predicted > 0:
+            avg_nll_tensor = total_nll_sum / num_tokens_predicted
+            avg_nll_value = avg_nll_tensor.detach().cpu().item()
+            perplexity_value = torch.exp(avg_nll_tensor).detach().cpu().item()
+        else:
+            avg_nll_value = 0.0
+            perplexity_value = 0.0
+     
+        if accuracy_results is None:
+            accuracy_results = dict()
+        accuracy_results['perplexity'] = perplexity_value
+        accuracy_results['avg_nll'] = avg_nll_value
+        accuracy_results['num_tokens'] = num_tokens_predicted
+     
+        # ---- Optional debug info (only built if a tokenizer is supplied) --------------
+        debug_predictions = list()
+        if tokenizer is not None:
+            top_k5 = torch.topk(lm_logits, k=5, dim=-1)
+            _lm_logits_softmax = torch.nn.functional.softmax(lm_logits, dim=-1)
+            argmax_value_soft = torch.max(_lm_logits_softmax, dim=-1)
+            top_k_softmax = torch.topk(_lm_logits_softmax, k=5, dim=-1)
+     
+            # _labels contains -100 at masked positions, which is not a valid vocab
+            # index / token id -- gather() and tokenizer decoding both require real
+            # ids. Build a clamped copy for indexing/decoding only; the *_prob /
+            # *_score / *_tokens values at masked positions are meaningless
+            # placeholders and should be ignored there (valid_mask / flat_valid
+            # already tells you which positions are real).
+            pad_token_id_for_decode = getattr(self.config, 'pad_token_id', 0) or 0
+            safe_labels = torch.where(
+                _labels == -100,
+                torch.full_like(_labels, pad_token_id_for_decode),
+                _labels
+            )
+     
+            expected_label_prob = torch.gather(_lm_logits_softmax, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+            expected_label_score = torch.gather(lm_logits, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+     
+            pred_tokens_flat = tokenizer.batch_decode(argmax.reshape(-1, 1))
+            expected_tokens_flat = tokenizer.batch_decode(safe_labels.reshape(-1, 1))
+     
+            kept_len = lm_logits.shape[1]
+     
+            def _regroup(flat_list):
+                return [flat_list[b * kept_len:(b + 1) * kept_len] for b in range(batch_size)]
+     
+            pred_tokens_grouped = _regroup(pred_tokens_flat)
+            expected_tokens_grouped = _regroup(expected_tokens_flat)
+     
+            pred_score = argmax_value.cpu().numpy().tolist()
+            pred_score_softmax = argmax_value_soft.values.cpu().numpy().tolist()
+            expected_label_prob_l = expected_label_prob.cpu().numpy().tolist()
+            expected_label_score_l = expected_label_score.cpu().numpy().tolist()
+     
+            top_k_tokens_list = top_k5.indices.cpu().numpy().tolist()
+            top_k_scores = top_k5.values.cpu().numpy().tolist()
+            top_k_softmax_scores = top_k_softmax.values.cpu().numpy().tolist()
+     
+            vocab_sum = lm_logits.sum(dim=-1).cpu().numpy().tolist()
+            vocab_mean = lm_logits.mean(dim=-1).cpu().numpy().tolist()
+            vocab_sum_soft = _lm_logits_softmax.sum(dim=-1).cpu().numpy().tolist()
+            vocab_mean_soft = _lm_logits_softmax.mean(dim=-1).cpu().numpy().tolist()
+            vocab_min = lm_logits.min(dim=-1).values.cpu().numpy().tolist()
+            vocab_min_soft = _lm_logits_softmax.min(dim=-1).values.cpu().numpy().tolist()
+     
+            exp_lm_logits = torch.exp(lm_logits)
+            exp_sum = exp_lm_logits.sum(dim=-1).cpu().numpy().tolist()
+            exp_mean = exp_lm_logits.mean(dim=-1).cpu().numpy().tolist()
+            exp_min = exp_lm_logits.min(dim=-1).values.cpu().numpy().tolist()
+            exp_max = exp_lm_logits.max(dim=-1).values.cpu().numpy().tolist()
+     
+            loss_scalar = loss.detach().cpu().numpy().tolist()  # mean loss over the whole sequence/batch
+     
+            for local_p in range(kept_len):
+                i_value = kept_positions[local_p]
+                batch_debug_info = {
+                    'sequence_index': i_value,
+                    'pred_tokens': [pred_tokens_grouped[b][local_p] for b in range(batch_size)],
+                    'pred_score': [pred_score[b][local_p] for b in range(batch_size)],
+                    'pred_score_softmax': [pred_score_softmax[b][local_p] for b in range(batch_size)],
+                    'expected_tokens': [expected_tokens_grouped[b][local_p] for b in range(batch_size)],
+                    'expected_label_prob': [expected_label_prob_l[b][local_p] for b in range(batch_size)],
+                    'expected_label_score': [expected_label_score_l[b][local_p] for b in range(batch_size)],
+                    'top_predicted_tokens': [
+                        tokenizer.convert_ids_to_tokens(top_k_tokens_list[b][local_p])
+                        for b in range(batch_size)
+                    ],
+                    'top_predicted_token_scores': [top_k_scores[b][local_p] for b in range(batch_size)],
+                    'top_predicted_tokens_softmax': [top_k_softmax_scores[b][local_p] for b in range(batch_size)],
+     
+                    'vocab_distribution_score_sum': [vocab_sum[b][local_p] for b in range(batch_size)],
+                    'vocab_distribution_score_mean': [vocab_mean[b][local_p] for b in range(batch_size)],
+                    'vocab_distribution_score_sum_softmax': [vocab_sum_soft[b][local_p] for b in range(batch_size)],
+                    'vocab_distribution_score_mean_softmax': [vocab_mean_soft[b][local_p] for b in range(batch_size)],
+                    'vocab_distrib_min_score': [vocab_min[b][local_p] for b in range(batch_size)],
+                    'vocab_distrib_min_score_softmax': [vocab_min_soft[b][local_p] for b in range(batch_size)],
+     
+                    'exp_vocab_distribution_score_sum': [exp_sum[b][local_p] for b in range(batch_size)],
+                    'exp_vocab_distribution_score_mean': [exp_mean[b][local_p] for b in range(batch_size)],
+                    'exp_vocab_distrib_min_score': [exp_min[b][local_p] for b in range(batch_size)],
+                    'exp_vocab_distrib_max_score': [exp_max[b][local_p] for b in range(batch_size)],
+     
+                    # NOTE: single scalar mean loss over the whole batch/sequence, not per-position
+                    # (same caveat as the windowed version -- there's now only one loss value total).
+                    'loss': loss_scalar,
+                }
+                for key, value in batch_debug_info.items():
+                    if isinstance(value, list):
+                        if len(value) > 0 and isinstance(value[0], list):
+                            batch_debug_info[key] = [[str(v) if str(v) in ['inf', '-inf'] else v for v in sublist] for sublist in value]
+                        else:
+                            batch_debug_info[key] = [str(v) if str(v) in ['inf', '-inf'] else v for v in value]
+                    elif isinstance(value, float) and (str(value) in ['inf', '-inf']):
+                        batch_debug_info[key] = str(value)
+                debug_predictions.append(batch_debug_info)
+     
+        batch_debug = dict(
+            ppl=accuracy_results['perplexity'],
+            avg_nll=accuracy_results['avg_nll'],
+            num_tokens=accuracy_results['num_tokens'],
+            accuracy=accuracy_results['accuracy'] if compute_accuracy else None,
+            correct_tokens=accuracy_results['correct_tokens'] if compute_accuracy else None,
+            total_tokens=accuracy_results['tot_tokens'] if compute_accuracy else None,
+            predictions=debug_predictions
+        )
+     
+        return MeMoCausalLMOutputWithPast(
+            loss=total_loss,
+            logits=None,
+            past_key_values=None,
+            hidden_states=None,
+            hidden_tokens=None,
+        ), accuracy_results, batch_debug
+
+    
+    # def forward_with_loss_parallelized(
+    #     self,
+    #     batch_inputs,
+    #     return_dict: Optional[bool] = None,
+    #     compute_accuracy=False,
+    #     # tokenizer = None
+    #     # pad_token_id=0
+    # ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
+
+    #     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    #     # batch_encoding = tokenizer.get_text_batch_encoding_for_loss(text=text_batch)
+    #     input_ids, labels = batch_inputs['input_ids'].to(self.memo.device), batch_inputs['labels'].to(self.memo.device)
+
+    #     logits_list = list()
+    #     outputs = None 
+    #     lm_logits = None
+    #     # for i in range(self.memo.chunk_length, labels.shape[1]):
+        
+    #     source_ids = windowed_sequence(
+    #         tensor_ids=input_ids,
+    #         window_size=self.memo.chunk_length,
+    #         # hidden_dim=self.memo.config.hi
+    #     )
+    #     # target_ids = windowed_sequence(
+    #     #     tensor_ids=labels[:, -self.memo.chunk_length:],
+    #     #     window_size=1
+    #     # )
+
+    #     outputs = self.forward(
+    #         input_ids=source_ids,
+    #         # labels=target_ids,
+    #         return_dict=return_dict,
+    #         compute_loss=True
+    #     )
+
+    #     logits = outputs.logits 
+    #     lm_logits = restore_windowed_sequence_outputs(
+    #         output_ids=logits,
+    #         batch_size=input_ids.shape[0],
+    #         hidden_dim=self.config.vocab_size
+    #     )
+    #         # logits_list.append(logits)
+        
+    #     # lm_logits = torch.cat(logits_list, dim=1)
+    #     _labels = labels[:, -lm_logits.shape[1]:].contiguous().to(self.memo.device)#labels
+    #     # _labels[_labels == pad_token_id] = -100 # TODO: manage situations in which EOS is 0; replace 0 with tokenizer.pad_token_id
+    #     loss = self.loss_function(logits=lm_logits, labels=_labels, vocab_size=self.config.vocab_size, shift_labels=_labels)
+    #     # pred = torch.max(lm_logits, dim=-1)
+    #     # p_indices, p_values = pred.indices, pred.values
+    #     accuracy_results = None
+    #     if compute_accuracy:
+    #         # argmax for selecting most probable labels
+    #         pred = torch.max(lm_logits, dim=-1)
+    #         p_indices, p_values = pred.indices, pred.values
+    #         # create bitmask for correctly predicted labels
+    #         correct_tokens = (p_indices == _labels).type(torch.int)
+    #         # set bitmask entries to 0 for -100 tokens
+    #         correct_tokens[_labels == -100] = 0
+    #         correct_tokens = torch.sum(correct_tokens)
+    #         # count how many tokens != -100 in labels
+    #         tot_tokens = torch.sum((_labels != -100).type(torch.int))
+    #         # compute accuracy, and return dictionary with these fields
+    #         accuracy_results = dict(
+    #             accuracy=(correct_tokens/tot_tokens).detach().cpu().item(),
+    #             correct_tokens=correct_tokens.detach().cpu().item(),
+    #             tot_tokens=tot_tokens.detach().cpu().item()
+    #         )
+
+
+
+
+    #     return MeMoCausalLMOutputWithPast(
+    #         loss=loss,
+    #         logits=lm_logits,
+    #         past_key_values=outputs.past_key_values,
+    #         hidden_states=outputs.hidden_states,
+    #         hidden_tokens=outputs.hidden_tokens,
+    #     ), accuracy_results
 

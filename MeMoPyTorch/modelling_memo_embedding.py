@@ -134,6 +134,7 @@ class MeMoEmbedding(Embedding):
         num_embeddings: int,
         embedding_dim: int,
         padding_idx: Optional[int] = None,
+        padding_seq_idx: Optional[int] = None,
         max_norm: Optional[float] = None,
         norm_type: float = 2.0,
         scale_grad_by_freq: bool = False,
@@ -162,6 +163,18 @@ class MeMoEmbedding(Embedding):
                 ), "Padding_idx must be within num_embeddings"
                 padding_idx = self.num_embeddings + padding_idx
         self.padding_idx = padding_idx
+        if padding_seq_idx is not None:
+            if padding_seq_idx > 0:
+                assert (
+                    padding_seq_idx < self.num_embeddings
+                ), "padding_seq_idx must be within num_embeddings"
+            elif padding_seq_idx < 0:
+                assert (
+                    padding_seq_idx >= -self.num_embeddings
+                ), "padding_seq_idx must be within num_embeddings"
+                padding_seq_idx = self.num_embeddings + padding_seq_idx
+        self.padding_seq_idx = padding_seq_idx
+        self.num_embeddings += 1
         self.max_norm = max_norm
         self.norm_type = norm_type
         self.scale_grad_by_freq = scale_grad_by_freq
@@ -200,11 +213,17 @@ class MeMoEmbedding(Embedding):
         #self.weight.data = self.weight.data.view(-1)[torch.randperm(self.weight.data.numel())].reshape(self.weight.data.shape)
         
         self._fill_padding_idx_with_zero()
+        self._fill_padding_seq_idx_with_one()
 
     def _fill_padding_idx_with_zero(self) -> None:
         if self.padding_idx is not None:
             with torch.no_grad():
                 self.weight[self.padding_idx].fill_(0)
+
+    def _fill_padding_seq_idx_with_one(self) -> None:
+        with torch.no_grad():
+            ### or 1/sqrt(d) ?? gianca [no test]
+            self.weight[self.padding_seq_idx].fill_(0) ############# temporary solution, should be filled with ones but it breaks the decoding of the sequence
 
     def forward(self, input: Tensor) -> Tensor:
         return F.embedding(
