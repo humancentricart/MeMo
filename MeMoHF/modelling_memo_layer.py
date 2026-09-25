@@ -280,25 +280,40 @@ class MeMoLayer(Module):
 
         #print('sequence_encoding', sequence_encoding.shape)
         #print('seq_enc_per_token', seq_enc_per_token.shape)
+
     def prod_with_shuf(self, input_sequence):
         B, L, H, D = input_sequence.shape
-        device = input_sequence.device
+        #device = input_sequence.device
 
-        sequence_encoding = torch.empty((B, L, D), device=device)
+        # acc = shuf dell'ultimo vettore lungo H
+        acc = input_sequence[:, :, -1]  # (B, L, D)
+        acc = acc[:, :, self.shuff]  # shuf(d)
 
-        for b in range(B):
-            for l in range(L):
-                v = input_sequence[b, l]  # vettori: a, b, c, d, ...
-                # iniziamo dall'ultimo vettore
-                acc = v[-1]
-                acc = acc[self.shuff]  # shuf(d)
-                # riduzione ricorsiva con shuffle
-                for i in range(H - 2, -1, -1):
-                    acc = v[i] * acc
-                    acc = acc[self.shuff]  # shuf(a * acc)
+        # riduzione ricorsiva vettorializzata
+        for i in range(H - 2, -1, -1):
+            acc = input_sequence[:, :, i] * acc  # (B, L, D)
+            acc = acc[:, :, self.shuff]  # shuf(a * acc)
 
-                    sequence_encoding[b, l] = acc
-        return sequence_encoding
+        return acc
+
+        #    def prod_with_shuf(self, input_sequence):
+        #        B, L, H, D = input_sequence.shape
+        #        device = input_sequence.device
+        #
+        #        sequence_encoding = torch.empty((B, L, D), device=device)
+        #        for b in range(B):
+        #            for l in range(L):
+        #                v = input_sequence[b, l]  # vettori: a, b, c, d, ...
+        #                # iniziamo dall'ultimo vettore
+        #                acc = v[-1]
+        #                acc = acc[self.shuff]  # shuf(d)
+        #                # riduzione ricorsiva con shuffle
+        #                for i in range(H - 2, -1, -1):
+        #                    acc = v[i] * acc
+        #                    acc = acc[self.shuff]  # shuf(a * acc)
+        #
+        #                    sequence_encoding[b, l] = acc
+        #        return sequence_encoding
 
     def penalize(self, sequence_encoding, seq_enc_per_token):
         # Penalizing factors to avoid multiple storage of the same sequence encoding in intermediate CMMs
