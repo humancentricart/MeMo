@@ -82,7 +82,7 @@ def enable_train(model):
     model.training = True
     model.train()
 
-def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches, train_custom_tokenizer):
+def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches, train_custom_tokenizer, truncation):
     cfg = {**memo_cfg, **train_cfg}
     model_name = convert_cfg_into_text(cfg=cfg)
     model_path = os.path.join(models_dir, model_name)
@@ -139,7 +139,7 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches, trai
     data_iter = data['train'].iter(batch_size=train_cfg['batch_size'])
     idx = 0
     for batch_examples in tqdm(data_iter):
-        data_batch = tokenizer.get_text_batch_encoding(batch_examples['text'], truncation=TRUNCATION)
+        data_batch = tokenizer.get_text_batch_encoding(batch_examples['text'], truncation=truncation)
         #print("data_batch")
         #print(data_batch['input_ids'].shape)
         if idx == 0:
@@ -167,7 +167,7 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches, trai
     torch.cuda.empty_cache()
     # return model_name, model, tokenizer
 
-def compute_ppl(model, tokenizer, device, data_iter, max_token_distrib_rank=10):
+def compute_ppl(model, tokenizer, device, data_iter, truncation, max_token_distrib_rank=10):
     """
     Compute perplexity and accuracy metrics on evaluation data.
     
@@ -198,7 +198,7 @@ def compute_ppl(model, tokenizer, device, data_iter, max_token_distrib_rank=10):
     debug_predictions = list()
     
     for batch_examples in tqdm(data_iter):
-        batch_inputs = tokenizer.get_text_batch_encoding_for_loss(text=batch_examples['text'], truncation=TRUNCATION)
+        batch_inputs = tokenizer.get_text_batch_encoding_for_loss(text=batch_examples['text'], truncation=truncation)
         # print("batch_inputs")
         # print(batch_inputs['input_ids'].shape)
         # print(batch_inputs['input_ids'])
@@ -297,7 +297,7 @@ def compute_ppl(model, tokenizer, device, data_iter, max_token_distrib_rank=10):
     return res_dict, debug_predictions
 
 
-def evaluate_memo(model_path, eval_datasets, batch_size=None, train_custom_tokenizer=False):
+def evaluate_memo(model_path, eval_datasets, truncation, batch_size=None, train_custom_tokenizer=False):
     if batch_size is None:
         batch_size = model_train_cfg['batch_size']
     batch_size = 1 # forced restriction due to issues with batch evaluation
@@ -328,7 +328,8 @@ def evaluate_memo(model_path, eval_datasets, batch_size=None, train_custom_token
             model=model,
             tokenizer=tokenizer,
             device=device,
-            data_iter=data_iter
+            data_iter=data_iter,
+            truncation=truncation
         )
 
     results = model_train_cfg
@@ -358,7 +359,7 @@ def equal_dicts(dict_a, dict_b, ignore_keys):
     return ka == kb and all(dict_a[k] == dict_b[k] for k in ka)
 
 
-def evaluate_single_batch_memo(model_path, batch_data, batch_size=None, train_custom_tokenizer=False):
+def evaluate_single_batch_memo(model_path, batch_data, truncation, batch_size=None, train_custom_tokenizer=False):
     batch_size = 1 # forced restriction due to issues with batch evaluation 
     seed_everything(42)
     model_train_cfg = convert_text_into_cfg(text=os.path.basename(model_path))
@@ -387,7 +388,8 @@ def evaluate_single_batch_memo(model_path, batch_data, batch_size=None, train_cu
             model=model,
             tokenizer=tokenizer,
             device=device,
-            data_iter=data_iter #[batch_data]
+            data_iter=data_iter,
+            truncation=truncation
         )
 
     del model, tokenizer
@@ -439,7 +441,8 @@ def experimental_management(params, memo_configs):
                     train_cfg=train_cfg,
                     data=data,
                     save_every_k_batches=save_every_k_batches,
-                    train_custom_tokenizer=train_custom_tokenizer
+                    train_custom_tokenizer=train_custom_tokenizer,
+                    truncation=params.truncation
                 )
                 train_df = update_df_list(df_list=train_df, update_entry=cfg, csv_path=train_csv)
                 torch.cuda.empty_cache()
@@ -461,7 +464,8 @@ def experimental_management(params, memo_configs):
                 model_path=model_path,
                 eval_datasets=sample_datasets,
                 batch_size=eval_batch_size,
-                train_custom_tokenizer=train_custom_tokenizer
+                train_custom_tokenizer=train_custom_tokenizer,
+                truncation=params.truncation
             )
             if results is None: continue
             # update the tracking list for evaluation
@@ -485,7 +489,8 @@ def experimental_management(params, memo_configs):
                 model_path=model_path,
                 batch_data=batch_data,
                 batch_size=eval_batch_size,
-                train_custom_tokenizer=train_custom_tokenizer
+                train_custom_tokenizer=train_custom_tokenizer,
+                truncation=params.truncation
             )
 
             print(f"batch accuracy: {results['accuracy']}")
@@ -523,6 +528,7 @@ class Arguments:
         train_csv=None,
         eval_csv=None,
         mem_curve_eval_csv=None,
+        truncation=None,
     ):
         self.data_dir = data_dir
         self.train_custom_tokenizer = train_custom_tokenizer
@@ -532,6 +538,7 @@ class Arguments:
         self.seeds = seeds if seeds is not None else [42]
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
+        self.truncation = truncation
 
         self.train_csv = (
             train_csv or f"memo_trained_wiki_20_6_prod{config['h']}|{config['l']}_zanz8_1d.csv"
@@ -543,9 +550,6 @@ class Arguments:
             mem_curve_eval_csv or f"mem_curve_eval_wiki_20_6_prod{config['h']}|{config['l']}_zanz8_1d.csv"
         )
 
-
-
-TRUNCATION = True # None
 
 
 if __name__ == "__main__":
@@ -573,7 +577,6 @@ if __name__ == "__main__":
         h = config["h"]
         print(f"Running for l={l}, h={h}...")
 
-        params = Arguments(config)
+        params = Arguments(config, truncation=True)
 
         experimental_management(params, memo_configs=[config])
-
