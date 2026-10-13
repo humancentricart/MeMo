@@ -30,6 +30,7 @@ LearningEvaluation/mem_curve*
 LearningEvaluation/memo_*
 LearningEvaluation/models*/*
 LearningEvaluation/original_training_data/*
+LearningEvaluation/old_mem_curve/*
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

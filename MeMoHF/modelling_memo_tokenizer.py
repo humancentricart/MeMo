@@ -171,55 +171,66 @@ class MeMoTokenizer(GPTNeoXTokenizerFast):
 
 
     def get_text_batch_encoding(self, text: Union[str, List[str], List[List[str]]] = None, 
-               padding='max_length', truncation=True, max_length=None):
+               padding='max_length', truncation=None):
+
+        # preserves the original input_ids, without truncation, and splits them into chunks of size self.model_max_length
+        if truncation is None or truncation == 'do_not_truncate' or truncation == False:
+            batch_input_ids = self.__call__(text, padding='longest', truncation='do_not_truncate', max_length=None)
+            batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=self.model_max_length)
+            for k in batch_input_ids:
+                n_text = batch_input_ids[k].shape[0]
+                new_seq = batch_input_ids[k].shape[1] // self.model_max_length
+                
+                batch_input_ids[k] = batch_input_ids[k].reshape(n_text * new_seq, self.model_max_length)
         
-        batch_input_ids = self.__call__(text, padding='longest', truncation='do_not_truncate', max_length=None)
-        batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=self.model_max_length)
+                # Identify rows that are not all zeros (only padding)
+                non_zero_mask = batch_input_ids[k].abs().sum(dim=1) != 0
+                # Filter rows using the mask
+                batch_input_ids[k] = batch_input_ids[k][non_zero_mask]
+            memo_input = self.get_memo_input(batch_input_ids)
 
-        for k in batch_input_ids:
-            n_text = batch_input_ids[k].shape[0]
-            new_seq = batch_input_ids[k].shape[1] // self.model_max_length
-            
-            batch_input_ids[k] = batch_input_ids[k].reshape(n_text * new_seq, self.model_max_length)
-    
-            # Identify rows that are not all zeros (only padding)
-            non_zero_mask = batch_input_ids[k].abs().sum(dim=1) != 0
-            # Filter rows using the mask
-            batch_input_ids[k] = batch_input_ids[k][non_zero_mask]
-
-
-        memo_input = self.get_memo_input(batch_input_ids)
-
+        # otherwise, truncate the input to self.model_max_length + 1, and return the memo_input of length self.model_max_length
+        else:
+            batch_input_ids = self.__call__(text, padding='max_length', truncation=True, max_length=self.model_max_length)
+            memo_input = self.get_memo_input(batch_input_ids)
+            #print(f"Truncation enabled input = {batch_input_ids['input_ids'].shape} vs {self.model_max_length} vs memo_input = {memo_input['input_ids'].shape}")
+        
         return memo_input
     
 
-    def get_text_batch_encoding_for_loss(self, text: Union[str, List[str], List[List[str]]] = None, max_length=None):
+    def get_text_batch_encoding_for_loss(self, text: Union[str, List[str], List[List[str]]] = None, 
+               padding='max_length', truncation=None, max_length=None):
+        
         if max_length is None: max_length = self.model_max_length
+        # preserves the original input_ids, without truncation, and splits them into chunks of size self.model_max_length
+        if truncation is None or truncation == 'do_not_truncate' or truncation == False:
+            batch_input_ids = self.__call__(text, padding='longest', truncation='do_not_truncate', max_length=None)
+            longest_length = batch_input_ids['input_ids'].shape[1]
+            batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=max_length)
 
-        batch_input_ids = self.__call__(text, padding='longest', truncation='do_not_truncate', max_length=None)
-        longest_length = batch_input_ids['input_ids'].shape[1]
-        batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=max_length)
+            # Identify rows that are not all zeros (only padding)
+            non_zero_mask = None #batch_input_ids['input_ids'].abs().sum(dim=1) != 0
 
-        # Identify rows that are not all zeros (only padding)
-        non_zero_mask = None #batch_input_ids['input_ids'].abs().sum(dim=1) != 0
+            for k in ['input_ids', 'token_type_ids']:#batch_input_ids:
+                n_text = batch_input_ids[k].shape[0]
+                new_seq = batch_input_ids[k].shape[1] // max_length
+                
+                batch_input_ids[k] = batch_input_ids[k].reshape(n_text * new_seq, self.model_max_length)
 
-        for k in ['input_ids', 'token_type_ids']:#batch_input_ids:
-            n_text = batch_input_ids[k].shape[0]
-            new_seq = batch_input_ids[k].shape[1] // max_length
-            
-            batch_input_ids[k] = batch_input_ids[k].reshape(n_text * new_seq, self.model_max_length)
-
-            if k == 'input_ids':
-                non_zero_mask = batch_input_ids['input_ids'].abs().sum(dim=1) != 0
-    
-            # Filter rows using the mask
-            if non_zero_mask is not None:
-                batch_input_ids[k] = batch_input_ids[k][non_zero_mask]
+                if k == 'input_ids':
+                    non_zero_mask = batch_input_ids['input_ids'].abs().sum(dim=1) != 0
+        
+                # Filter rows using the mask
+                if non_zero_mask is not None:
+                    batch_input_ids[k] = batch_input_ids[k][non_zero_mask]
+            memo_input = self.get_memo_input(batch_input_ids)
+        else:
+            batch_input_ids = self.__call__(text, padding='max_length', truncation=True, max_length=self.model_max_length)
+            memo_input = self.get_memo_input(batch_input_ids)
 
         ##### ESR 2029-09-08 # removed to pair it with forward_with_loss_simple
         #batch_input_ids = self.pad(batch_input_ids, pad_to_multiple_of=max_length+longest_length)
-
-        memo_input = self.get_memo_input(batch_input_ids)
+        
         batch_encoding = memo_input
 
         # prepare inputs for computing the loss of the full-lenght sentence, which consists into the following steps:

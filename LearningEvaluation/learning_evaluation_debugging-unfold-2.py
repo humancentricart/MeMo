@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import torch
 
@@ -139,11 +139,12 @@ def train_memo(models_dir, memo_cfg, train_cfg, data, save_every_k_batches, trai
     data_iter = data['train'].iter(batch_size=train_cfg['batch_size'])
     idx = 0
     for batch_examples in tqdm(data_iter):
-        data_batch = tokenizer.get_text_batch_encoding(batch_examples['text'])
+        data_batch = tokenizer.get_text_batch_encoding(batch_examples['text'], truncation=TRUNCATION)
         #print("data_batch")
         #print(data_batch['input_ids'].shape)
         if idx == 0:
             print(data_batch['input_ids'])
+            print(data_batch['input_ids'].shape)
         model.memorize_text(data_batch)
         idx += 1
         if save_every_k_batches > 0 and idx % save_every_k_batches == 0:
@@ -197,10 +198,10 @@ def compute_ppl(model, tokenizer, device, data_iter, max_token_distrib_rank=10):
     debug_predictions = list()
     
     for batch_examples in tqdm(data_iter):
-        batch_inputs = tokenizer.get_text_batch_encoding_for_loss(text=batch_examples['text'])
-        #print("batch_inputs")
-        #print(batch_inputs['input_ids'].shape)
-        #print(batch_inputs['input_ids'])
+        batch_inputs = tokenizer.get_text_batch_encoding_for_loss(text=batch_examples['text'], truncation=TRUNCATION)
+        # print("batch_inputs")
+        # print(batch_inputs['input_ids'].shape)
+        # print(batch_inputs['input_ids'])
         with torch.no_grad():
             outputs, accuracy, batch_debug_info = model.forward_with_loss_simple( #unfold
                 batch_inputs=batch_inputs,
@@ -395,7 +396,7 @@ def evaluate_single_batch_memo(model_path, batch_data, batch_size=None, train_cu
 
 
 
-def experimental_management(params):
+def experimental_management(params, memo_configs):
     train_custom_tokenizer = params.train_custom_tokenizer
     batch_size = params.batch_size
     eval_batch_size = params.eval_batch_size
@@ -503,43 +504,76 @@ def experimental_management(params):
             )
 
     
-l = 6
-h = 4
-
-memo_configs = [
-    # dict(max_length=1024, d=1024, l=4, h=4),
-    # dict(max_length=4096, d=16384, l=6, h=4, alpha_gen=1, compositionOp='prod'),
-    # dict(max_length=4096, d=8192, l=6, h=4, alpha_gen=1, compositionOp='prod'),
-    dict(max_length=h ** l, d=4096, l=l, h=h, alpha_gen=1, compositionOp='prod', padding_vector_component_values=1/(4096**(1/2)) )#compositionOp='JLT', padding_vector_component_values=0)#
-    #dict(max_length=4096, d=2048, l=6, h=4, alpha_gen=1, compositionOp='prod'),
-    #dict(max_length=4096, d=4096, l=6, h=4, alpha_gen=1, compositionOp='Sum'),
-]
 
 
-import argparse
 
-parser = argparse.ArgumentParser() 
-parser.add_argument('--data_dir', default='original_training_data/new_sample/pile_mini')#mini') #samples') 
-# parser.add_argument('--data_dir', default='training_data/new_sample/scaling') #samples')
-# parser.add_argument('--models_dir', default='models_scale_1k')
-parser.add_argument('--train_custom_tokenizer', default=False)
-parser.add_argument('--models_dir', default='models_pile_mini_6_prod6_select1_resu_1d')
-parser.add_argument('--seeds', default=[42])
-parser.add_argument('--batch_size', default=2)
-parser.add_argument('--eval_batch_size', default=2)
-# parser.add_argument('--train_csv', default='memo_trained_scale_1k.csv')
-# parser.add_argument('--eval_csv', default='memo_ppl_train_eval_scale_1k.csv')
-# parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval_scale_1k.csv')
-parser.add_argument('--train_csv', default='memo_trained_pile_mini_6_prod6_select1_resu_1d.csv')
-parser.add_argument('--eval_csv', default='memo_ppl_train_eval_pile_mini_6_prod6_select1_resu_1d.csv')
-parser.add_argument('--mem_curve_eval_csv', default='mem_curve_eval_pile_mini_6_prod6_select1_resu_1d.csv')
-# parser.add_argument('--')
+import os
 
 
+class Arguments:
+    def __init__(
+        self,
+        config,
+        data_dir="./original_training_data/scaling_curve",
+        train_custom_tokenizer=False,
+        models_dir=None,
+        seeds=None,
+        batch_size=2,
+        eval_batch_size=2,
+        train_csv=None,
+        eval_csv=None,
+        mem_curve_eval_csv=None,
+    ):
+        self.data_dir = data_dir
+        self.train_custom_tokenizer = train_custom_tokenizer
+        self.models_dir = (
+            models_dir or f"models_wiki_20_6_prod{config['h']}|{config['l']}_zanz8_1d"
+        )
+        self.seeds = seeds if seeds is not None else [42]
+        self.batch_size = batch_size
+        self.eval_batch_size = eval_batch_size
+
+        self.train_csv = (
+            train_csv or f"memo_trained_wiki_20_6_prod{config['h']}|{config['l']}_zanz8_1d.csv"
+        )
+        self.eval_csv = (
+            eval_csv or f"memo_ppl_train_eval_wiki_20_6_prod{config['h']}|{config['l']}_zanz8_1d.csv"
+        )
+        self.mem_curve_eval_csv = (
+            mem_curve_eval_csv or f"mem_curve_eval_wiki_20_6_prod{config['h']}|{config['l']}_zanz8_1d.csv"
+        )
+
+
+
+TRUNCATION = True # None
 
 
 if __name__ == "__main__":
     print(os.getcwd())
-    params = parser.parse_args()
-    experimental_management(params)
+
+    ls = [3]#, 4, 6]
+    hs = [4]#, 8]
+    d = 4096
+
+    memo_configs = [
+        dict(
+            max_length=h**l,
+            d=d,
+            l=l,
+            h=h,
+            alpha_gen=1,
+            compositionOp="prod",
+            padding_vector_component_values=1 / (d**0.5),
+        )
+        for l in ls for h in hs
+    ]
+
+    for config in memo_configs:
+        l = config["l"]
+        h = config["h"]
+        print(f"Running for l={l}, h={h}...")
+
+        params = Arguments(config)
+
+        experimental_management(params, memo_configs=[config])
 

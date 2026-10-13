@@ -36,7 +36,7 @@ import math
 
 VERBOSE = False
 #DEVICE = 'cpu'
-DEBUGGING = True
+DEBUGGING = False
 
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
