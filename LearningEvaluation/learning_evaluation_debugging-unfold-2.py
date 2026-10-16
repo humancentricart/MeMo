@@ -533,7 +533,7 @@ class Arguments:
         self.data_dir = data_dir
         self.train_custom_tokenizer = train_custom_tokenizer
         self.models_dir = (
-            models_dir or f"models_wiki_20_6_prod{config['h']}|{config['l']}_zanz8_1d"
+            models_dir or f"models_wiki_20_6_prod{config['h']}|{config['l']}_SHUFF_lambda5_zanz8_1d"
         )
         self.seeds = seeds if seeds is not None else [42]
         self.batch_size = batch_size
@@ -541,13 +541,13 @@ class Arguments:
         self.truncation = truncation
 
         self.train_csv = (
-            train_csv or f"memo_trained_wiki_20_6_prod{config['h']}|{config['l']}_zanz8_1d.csv"
+            train_csv or f"memo_trained_wiki_20_6_prod{config['h']}|{config['l']}_SHUFF_lambda5_zanz8_1d.csv"
         )
         self.eval_csv = (
-            eval_csv or f"memo_ppl_train_eval_wiki_20_6_prod{config['h']}|{config['l']}_zanz8_1d.csv"
+            eval_csv or f"memo_ppl_train_eval_wiki_20_6_prod{config['h']}|{config['l']}_SHUFF_lambda5_zanz8_1d.csv"
         )
         self.mem_curve_eval_csv = (
-            mem_curve_eval_csv or f"mem_curve_eval_wiki_20_6_prod{config['h']}|{config['l']}_zanz8_1d.csv"
+            mem_curve_eval_csv or f"mem_curve_eval_wiki_20_6_prod{config['h']}|{config['l']}_SHUFF_lambda5_zanz8_1d.csv"
         )
 
 
@@ -555,8 +555,7 @@ class Arguments:
 if __name__ == "__main__":
     print(os.getcwd())
 
-    ls = [3]#, 4, 6]
-    hs = [4]#, 8]
+    lhs = {3: [4], 4:[4], 6: [4]}
     d = 4096
 
     memo_configs = [
@@ -566,10 +565,10 @@ if __name__ == "__main__":
             l=l,
             h=h,
             alpha_gen=1,
-            compositionOp="prod",
+            compositionOp='ProdWithShuffling',#compositionOp="prod",
             padding_vector_component_values=1 / (d**0.5),
         )
-        for l in ls for h in hs
+        for l in lhs for h in lhs[l]
     ]
 
     for config in memo_configs:

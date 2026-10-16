@@ -115,10 +115,11 @@ class MeMoCausalLMOutputWithPast(ModelOutput):
 
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
+    lm_logits_unpacked: Optional[torch.FloatTensor] = None
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     hidden_tokens: Optional[Tuple[torch.FloatTensor, ...]] = None
-
+    
 
 
 class MeMoLayers(ModuleList):
@@ -397,6 +398,9 @@ class MeMo(MeMoPreTrainedModel):
         #    last_layer.directly_memorize(seq_encoding_for_the_last_layer)
 
         for layer_level in range(self.l):
+            if DEBUGGING:
+                print("*"*80)
+                print(f"Layer {layer_level}")
             input_sequence = self.generate_sequences(input_seqs=input_sequence, layer=layer_level)
             
             if DEBUGGING:
@@ -559,6 +563,9 @@ class MeMo(MeMoPreTrainedModel):
         #    #    print((retreived_output_symbol_vector, score_max))
 
         for layer_level in range(self.l):
+            if DEBUGGING:
+                print("*"*80)
+                print(f"Layer {layer_level}")
             sequence_representation = self.generate_sequences(input_seqs=sequence_representation, layer=layer_level)
 
             if output_hidden_states:
@@ -736,6 +743,8 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         # [num_layers] -> [num_layers, 1, 1, 1]
         weights = weights.view(num_layers, 1, 1, 1)
         
+        
+        lm_logits_unpacked = lm_logits
         lm_logits = (lm_logits * weights).sum(dim=0) / weights.sum()
         
         ## ESR 2026-09-16
@@ -759,6 +768,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             hidden_tokens=outputs.hidden_tokens,
+            lm_logits_unpacked=lm_logits_unpacked
         )
 
     # TODO remove, should not be here, added just for checks and complaiance for the original implementation

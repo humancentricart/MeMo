@@ -247,19 +247,54 @@ class MeMoLayer(Module):
         #self.Prj.reset_parameters()
         #self.CMM.reset_parameters()
     
+
+    def inspect_tensor(self, name, x):
+        x = x.detach().float()
+
+        print(
+            f"{name} | shape={tuple(x.shape)} | "
+            f"mean={x.mean().item():.5g} | "
+            f"std={x.std().item():.5g} | "
+            f"mean_abs={x.abs().mean().item():.5g} | "
+            f"rms={x.square().mean().sqrt().item():.5g} | "
+            f"min_abs={x.abs().amin().item():.5g} | "
+            f"max_abs={x.abs().amax().item():.5g} | "
+            f"zero_frac={(x == 0).float().mean().item():.5g}"
+        )
+
+        # L2 norm of each [hidden_dim] vector, aggregated over batch and tot_seq
+        norms = x.norm(dim=-1)
+
+        print(
+            f"{name} | vector L2 norm: "
+            f"mean={norms.mean().item():.5g} | "
+            f"std={norms.std().item():.5g} | "
+            f"min={norms.amin().item():.5g} | "
+            f"max={norms.amax().item():.5g}"
+        )
+
     def get_projections(self, input_sequence, blocks, h, d):
         #print('input_sequence.shape, layer', input_sequence.shape)
         #print('self.d, self.h', self.d, self.h)
         # shape (blocks,self.d)
         #print(input_sequence.reshape((blocks,self.d * self.h)).shape)
         batch_size = input_sequence.shape[0]
+        if DEBUGGING:
+            print(self.inspect_tensor('input', input_sequence))
+
         if self.compOp == CompositionOp.PROD:
             sequence_encoding = torch.prod(input_sequence,2)
             sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
             return sequence_encoding, None
         elif self.compOp == CompositionOp.PRODWITHSHUFFLING:
-            sequence_encoding = self.prod_with_shuf(input_sequence)
+            sequence_encoding = self.tempered_prod_with_shuf(input_sequence)
+            if DEBUGGING:
+                print(self.inspect_tensor('output BEFOR NORM', sequence_encoding))
             sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
+            # print('sequence_encoding.shape', sequence_encoding.shape)
+            # print("average norm of sequence_encoding", torch.mean(torch.linalg.norm(sequence_encoding, dim=-1)))
+            if DEBUGGING:
+                print(self.inspect_tensor('output', sequence_encoding))
             return sequence_encoding, None
 
         ## ESR 2026-09-06 still unclear to me 
@@ -295,6 +330,55 @@ class MeMoLayer(Module):
             acc = acc[:, :, self.shuff]  # shuf(a * acc)
 
         return acc
+
+    
+    def prod_with_shuf_log(self, input_sequence, eps=1e-12):
+        B, L, H, D = input_sequence.shape
+
+        # log|x| and sign, handled separately (log is undefined for x <= 0)
+        log_x = torch.log(input_sequence.abs().clamp_min(eps))
+        sign_x = torch.sign(input_sequence)
+
+        log_acc = log_x[:, :, -1][:, :, self.shuff]
+        sign_acc = sign_x[:, :, -1][:, :, self.shuff]
+
+        for i in range(H - 2, -1, -1):
+            log_acc = (log_x[:, :, i] + log_acc)[:, :, self.shuff]    # sum of logs
+            sign_acc = (sign_x[:, :, i] * sign_acc)[:, :, self.shuff]
+
+        return sign_acc * torch.exp(log_acc)
+
+
+    def build_shuf_powers(self, H):
+        # idx[i] = shuff applied (i+1) times, as an index tensor (H, D)
+        idxs, p = [], self.shuff.clone()
+        for _ in range(H):
+            idxs.append(p)
+            p = p[self.shuff]
+        return torch.stack(idxs)
+
+    def tempered_prod_with_shuf(self, input_sequence, alpha=0.7, eps=1e-12):
+        # input_sequence: (B, L, H, D)
+        B, L, H, D = input_sequence.shape
+
+        idx = self.build_shuf_powers(H).to(input_sequence.device)   # (H, D)
+        idx = idx[None, None].expand(B, L, H, D)
+
+        log_x = torch.log(input_sequence.abs().clamp_min(eps))
+        sign_x = torch.sign(input_sequence)
+
+        # each h-slice is shuffled by its own power: x_i gets shuf^(i+1)
+        log_sh = torch.gather(log_x, 3, idx)
+        sign_sh = torch.gather(sign_x, 3, idx)
+
+        signs = sign_sh.prod(dim=2)                                  # (B, L, D)
+        log_magnitudes = log_sh.sum(dim=2) * alpha                   # tempered sum of logs
+
+        # stable exp: subtract the max over the hidden dim
+        log_magnitudes = log_magnitudes - log_magnitudes.amax(dim=-1, keepdim=True)
+
+        output = signs * torch.exp(log_magnitudes)
+        return output
 
         #    def prod_with_shuf(self, input_sequence):
         #        B, L, H, D = input_sequence.shape
