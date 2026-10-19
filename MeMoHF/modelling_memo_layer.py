@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 
 DEBUGGING = False
+DEBUGGING_PROJECTION = False
 verbose = False
 
 
@@ -197,6 +198,7 @@ class CompositionOp(Enum):
     PROD = 2
     SUM = 3
     PRODWITHSHUFFLING = 4
+    SUMTHENPRODWITHSHUFFLING = 5
 
 
 class MeMoLayer(Module):
@@ -223,7 +225,7 @@ class MeMoLayer(Module):
             self.Prj = ProjectionSequence(self.d, self.d*self.h, init_weights=init_weights)
 
 
-        if self.compOp == CompositionOp.PRODWITHSHUFFLING:
+        if self.compOp == CompositionOp.PRODWITHSHUFFLING or self.compOp == CompositionOp.SUMTHENPRODWITHSHUFFLING:
             self.shuff = torch.randperm(self.d)
 
         ### ESR 2026-09-08 actually used only for "directly memorize"
@@ -279,24 +281,36 @@ class MeMoLayer(Module):
         # shape (blocks,self.d)
         #print(input_sequence.reshape((blocks,self.d * self.h)).shape)
         batch_size = input_sequence.shape[0]
-        if DEBUGGING:
+        if DEBUGGING_PROJECTION:
             print(self.inspect_tensor('input', input_sequence))
 
         if self.compOp == CompositionOp.PROD:
             sequence_encoding = torch.prod(input_sequence,2)
             sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
             return sequence_encoding, None
+        
         elif self.compOp == CompositionOp.PRODWITHSHUFFLING:
-            sequence_encoding = self.tempered_prod_with_shuf(input_sequence)
-            if DEBUGGING:
+            sequence_encoding = self.prod_with_shuf(input_sequence)
+            if DEBUGGING_PROJECTION:
                 print(self.inspect_tensor('output BEFOR NORM', sequence_encoding))
             sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
             # print('sequence_encoding.shape', sequence_encoding.shape)
             # print("average norm of sequence_encoding", torch.mean(torch.linalg.norm(sequence_encoding, dim=-1)))
-            if DEBUGGING:
+            if DEBUGGING_PROJECTION:
                 print(self.inspect_tensor('output', sequence_encoding))
             return sequence_encoding, None
-
+        
+        elif self.compOp == CompositionOp.SUMTHENPRODWITHSHUFFLING:
+            sequence_encoding = self.sum_prod_with_shuf(input_sequence)
+            if DEBUGGING_PROJECTION:
+                print(self.inspect_tensor('output BEFOR NORM', sequence_encoding))
+            sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
+            # print('sequence_encoding.shape', sequence_encoding.shape)
+            # print("average norm of sequence_encoding", torch.mean(torch.linalg.norm(sequence_encoding, dim=-1)))
+            if DEBUGGING_PROJECTION:
+                print(self.inspect_tensor('output', sequence_encoding))
+            return sequence_encoding, None
+        
         ## ESR 2026-09-06 still unclear to me 
         elif self.compOp == CompositionOp.JLT:
             sequence_encoding = self.Prj(input_sequence.reshape((batch_size, blocks, self.d * self.h)))
@@ -310,6 +324,7 @@ class MeMoLayer(Module):
             sequence_encoding = torch.sum(input_sequence,2)
             sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
             return sequence_encoding, None
+        
         else: 
             print("ERROR")
 
@@ -331,7 +346,7 @@ class MeMoLayer(Module):
 
         return acc
 
-    
+    ### ESR is it collapsing many dimension to 0 for later layer
     def prod_with_shuf_log(self, input_sequence, eps=1e-12):
         B, L, H, D = input_sequence.shape
 
@@ -348,7 +363,27 @@ class MeMoLayer(Module):
 
         return sign_acc * torch.exp(log_acc)
 
+    def sum_prod_with_shuf(self, input_sequence, bag_of_words_until=None, eps=1e-12):
+        B, L, H, D = input_sequence.shape
+        if bag_of_words_until is None:
+            bag_of_words_until = H - 1
+        if not 0 <= bag_of_words_until <= H:
+            raise ValueError(
+                f"bag_of_words_until must be between 0 and {H}"
+            )
 
+        bag_of_words = input_sequence[:, :, :bag_of_words_until, :].sum(dim=2).unsqueeze(dim=2)
+        if DEBUGGING_PROJECTION:
+            print("bag_of_words.shape", bag_of_words.shape)
+        vectors_to_compose = torch.cat(
+            (bag_of_words, input_sequence[:, :, bag_of_words_until:, :]),
+            dim=2,
+        )
+        if DEBUGGING_PROJECTION:
+            print("vectors_to_compose.shape", vectors_to_compose.shape)
+        return self.prod_with_shuf(vectors_to_compose)
+
+    ### ESR this can be reused in any case
     def build_shuf_powers(self, H):
         # idx[i] = shuff applied (i+1) times, as an index tensor (H, D)
         idxs, p = [], self.shuff.clone()
@@ -357,6 +392,7 @@ class MeMoLayer(Module):
             p = p[self.shuff]
         return torch.stack(idxs)
 
+    ### ESR is it mixing sequences to much? composed seq has no 0
     def tempered_prod_with_shuf(self, input_sequence, alpha=0.7, eps=1e-12):
         # input_sequence: (B, L, H, D)
         B, L, H, D = input_sequence.shape
@@ -663,4 +699,3 @@ class MeMoLayer(Module):
 
     def directly_retrieve(self,vector):
         return self.CMM(vector)
-

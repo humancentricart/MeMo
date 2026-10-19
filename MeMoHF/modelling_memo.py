@@ -210,7 +210,7 @@ class MeMo(MeMoPreTrainedModel):
         self.max_len = self.h**self.l
         self.chunk_length = chunk_length
         self.layerized_CMM_OUT = layerized_CMM_OUT
-        self.lambda_val = 1#0.5 #lambda_val
+        self.lambda_val = 0.9 #0.5 #lambda_val
 
         self.padding_vector_component_values = padding_vector_component_values
         print("Padding input tokens in MeMo architecture: ", self.padding_vector_component_values)
@@ -225,12 +225,26 @@ class MeMo(MeMoPreTrainedModel):
                                      init_weights=init_weights, padding_vector_component_values=self.padding_vector_component_values)        #### FMZ 2026-07-01 - Encoding in
         self.output_encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, padding_seq_idx=padding_seq_idx, 
                                             init_weights=init_weights, padding_vector_component_values=0) #### FMZ 2026-07-01 - Encoding out ## if !=0 accuracy drop
-        self.layers = MeMoLayers(
-            [
-                MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
-                for i in range(num_of_layers)
-            ]
-        )
+        
+        if (compositionOp != CompositionOp.PROD and compositionOp != CompositionOp.PRODWITHSHUFFLING) or num_of_layers<= 3:
+            self.layers = MeMoLayers(
+                [
+                    MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
+                    for i in range(num_of_layers)
+                ]
+            )
+        else:
+            ## ESR hardcoded num of layers (3) for now, from exp results
+             self.layers = MeMoLayers(
+                [
+                    MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
+                    for i in range(2)
+                ] + 
+                [
+                    MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=CompositionOp.SUMTHENPRODWITHSHUFFLING, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
+                    for i in range(2, num_of_layers)
+                ]
+            )
 
     def generate_sequences(self, input_seqs, layer: int):
 
