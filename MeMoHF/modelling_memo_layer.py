@@ -373,6 +373,7 @@ class MeMoLayer(Module):
             )
 
         bag_of_words = input_sequence[:, :, :bag_of_words_until, :].sum(dim=2).unsqueeze(dim=2)
+        bag_of_words = F.normalize(bag_of_words, p=2, dim=2)
         if DEBUGGING_PROJECTION:
             print("bag_of_words.shape", bag_of_words.shape)
         vectors_to_compose = torch.cat(
