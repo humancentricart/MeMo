@@ -226,7 +226,10 @@ class MeMoLayer(Module):
 
 
         if self.compOp == CompositionOp.PRODWITHSHUFFLING or self.compOp == CompositionOp.SUMTHENPRODWITHSHUFFLING:
-            self.shuff = torch.randperm(self.d)
+            # ESR 20/10/2026
+            # this assigns the same permutation to each position!!
+            #self.shuff = torch.randperm(self.d)
+            self.shuff = torch.stack([torch.randperm(self.d) for i in range(self.h)])
 
         ### ESR 2026-09-08 actually used only for "directly memorize"
         #CMM : correlation matrix memory for the specific layer
@@ -331,18 +334,33 @@ class MeMoLayer(Module):
         #print('sequence_encoding', sequence_encoding.shape)
         #print('seq_enc_per_token', seq_enc_per_token.shape)
 
+    # def prod_with_shuf(self, input_sequence):
+    #     B, L, H, D = input_sequence.shape
+    #     #device = input_sequence.device
+
+    #     # acc = shuf dell'ultimo vettore lungo H
+    #     acc = input_sequence[:, :, -1]  # (B, L, D)
+    #     acc = acc[:, :, self.shuff]  # shuf(d)
+
+    #     # riduzione ricorsiva vettorializzata
+    #     for i in range(H - 2, -1, -1):
+    #         acc = input_sequence[:, :, i] * acc  # (B, L, D)
+    #         acc = acc[:, :, self.shuff]  # shuf(a * acc)
+
+    #     return acc
+
+    # ESR 2026/10/20 reimplemented shuffled prod, 1 shuff per position!
     def prod_with_shuf(self, input_sequence):
         B, L, H, D = input_sequence.shape
-        #device = input_sequence.device
 
-        # acc = shuf dell'ultimo vettore lungo H
-        acc = input_sequence[:, :, -1]  # (B, L, D)
-        acc = acc[:, :, self.shuff]  # shuf(d)
+        # Start from the last vector and apply its position-specific permutation
+        acc = input_sequence[:, :, -1, :]
+        acc = acc[..., self.shuff[H - 1]]
 
-        # riduzione ricorsiva vettorializzata
+        # Recursive composition with position-specific permutations
         for i in range(H - 2, -1, -1):
-            acc = input_sequence[:, :, i] * acc  # (B, L, D)
-            acc = acc[:, :, self.shuff]  # shuf(a * acc)
+            acc = input_sequence[:, :, i, :] * acc
+            acc = acc[..., self.shuff[i]]
 
         return acc
 
@@ -373,7 +391,7 @@ class MeMoLayer(Module):
             )
 
         bag_of_words = input_sequence[:, :, :bag_of_words_until, :].sum(dim=2).unsqueeze(dim=2)
-        bag_of_words = F.normalize(bag_of_words, p=2, dim=2)
+        bag_of_words = F.normalize(bag_of_words, p=2, dim=-1)
         if DEBUGGING_PROJECTION:
             print("bag_of_words.shape", bag_of_words.shape)
         vectors_to_compose = torch.cat(
