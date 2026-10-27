@@ -317,7 +317,7 @@ class MeMoLayer(Module):
             sequence_encoding = self.shuffled_circular_convolution(input_sequence)
             if DEBUGGING_PROJECTION:
                 self.inspect_tensor('output BEFOR NORM', sequence_encoding)
-            #sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
+            sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
             if DEBUGGING_PROJECTION:
                 self.inspect_tensor('output', sequence_encoding)
             return sequence_encoding, None
