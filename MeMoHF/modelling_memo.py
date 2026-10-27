@@ -37,7 +37,7 @@ import math
 VERBOSE = False
 #DEVICE = 'cpu'
 DEBUGGING = False
-DEBUGGING_PROJECTION = True
+DEBUGGING_PROJECTION = False
 
 from dataclasses import dataclass
 from transformers.utils import ModelOutput

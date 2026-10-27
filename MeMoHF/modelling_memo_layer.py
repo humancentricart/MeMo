@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 
 DEBUGGING = False
-DEBUGGING_PROJECTION = True
+DEBUGGING_PROJECTION = False
 verbose = False
 
 
