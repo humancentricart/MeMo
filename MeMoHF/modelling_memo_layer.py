@@ -277,6 +277,7 @@ class MeMoLayer(Module):
             f"min={norms.amin().item():.5g} | "
             f"max={norms.amax().item():.5g}"
         )
+        print("-"*80)
 
     def get_projections(self, input_sequence, blocks, h, d):
         #print('input_sequence.shape, layer', input_sequence.shape)
@@ -285,7 +286,7 @@ class MeMoLayer(Module):
         #print(input_sequence.reshape((blocks,self.d * self.h)).shape)
         batch_size = input_sequence.shape[0]
         if DEBUGGING_PROJECTION:
-            print(self.inspect_tensor('input', input_sequence))
+            self.inspect_tensor('input', input_sequence)
 
         if self.compOp == CompositionOp.PROD:
             sequence_encoding = torch.prod(input_sequence,2)
@@ -295,23 +296,23 @@ class MeMoLayer(Module):
         elif self.compOp == CompositionOp.PRODWITHSHUFFLING:
             sequence_encoding = self.prod_with_shuf(input_sequence)
             if DEBUGGING_PROJECTION:
-                print(self.inspect_tensor('output BEFOR NORM', sequence_encoding))
+                self.inspect_tensor('output BEFOR NORM', sequence_encoding)
             sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
             # print('sequence_encoding.shape', sequence_encoding.shape)
             # print("average norm of sequence_encoding", torch.mean(torch.linalg.norm(sequence_encoding, dim=-1)))
             if DEBUGGING_PROJECTION:
-                print(self.inspect_tensor('output', sequence_encoding))
+                self.inspect_tensor('output', sequence_encoding)
             return sequence_encoding, None
         
         elif self.compOp == CompositionOp.SUMTHENPRODWITHSHUFFLING:
             sequence_encoding = self.sum_prod_with_shuf(input_sequence)
             if DEBUGGING_PROJECTION:
-                print(self.inspect_tensor('output BEFOR NORM', sequence_encoding))
+                self.inspect_tensor('output BEFOR NORM', sequence_encoding)
             sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
             # print('sequence_encoding.shape', sequence_encoding.shape)
             # print("average norm of sequence_encoding", torch.mean(torch.linalg.norm(sequence_encoding, dim=-1)))
             if DEBUGGING_PROJECTION:
-                print(self.inspect_tensor('output', sequence_encoding))
+                self.inspect_tensor('output', sequence_encoding)
             return sequence_encoding, None
         
         ## ESR 2026-09-06 still unclear to me 
@@ -383,6 +384,9 @@ class MeMoLayer(Module):
 
     def sum_prod_with_shuf(self, input_sequence, bag_of_words_until=None, eps=1e-12):
         B, L, H, D = input_sequence.shape
+        for i in range(H):
+            input_sequence[:, :, i] = input_sequence[:, :, i, self.shuff[i]]
+
         if bag_of_words_until is None:
             bag_of_words_until = H - 1
         if not 0 <= bag_of_words_until <= H:
@@ -392,48 +396,15 @@ class MeMoLayer(Module):
 
         bag_of_words = input_sequence[:, :, :bag_of_words_until, :].sum(dim=2).unsqueeze(dim=2)
         bag_of_words = F.normalize(bag_of_words, p=2, dim=-1)
-        if DEBUGGING_PROJECTION:
-            print("bag_of_words.shape", bag_of_words.shape)
+        #if DEBUGGING_PROJECTION:
+        #    print("bag_of_words.shape", bag_of_words.shape)
         vectors_to_compose = torch.cat(
             (bag_of_words, input_sequence[:, :, bag_of_words_until:, :]),
             dim=2,
         )
-        if DEBUGGING_PROJECTION:
-            print("vectors_to_compose.shape", vectors_to_compose.shape)
-        return self.prod_with_shuf(vectors_to_compose)
-
-    ### ESR this can be reused in any case
-    def build_shuf_powers(self, H):
-        # idx[i] = shuff applied (i+1) times, as an index tensor (H, D)
-        idxs, p = [], self.shuff.clone()
-        for _ in range(H):
-            idxs.append(p)
-            p = p[self.shuff]
-        return torch.stack(idxs)
-
-    ### ESR is it mixing sequences to much? composed seq has no 0
-    def tempered_prod_with_shuf(self, input_sequence, alpha=0.7, eps=1e-12):
-        # input_sequence: (B, L, H, D)
-        B, L, H, D = input_sequence.shape
-
-        idx = self.build_shuf_powers(H).to(input_sequence.device)   # (H, D)
-        idx = idx[None, None].expand(B, L, H, D)
-
-        log_x = torch.log(input_sequence.abs().clamp_min(eps))
-        sign_x = torch.sign(input_sequence)
-
-        # each h-slice is shuffled by its own power: x_i gets shuf^(i+1)
-        log_sh = torch.gather(log_x, 3, idx)
-        sign_sh = torch.gather(sign_x, 3, idx)
-
-        signs = sign_sh.prod(dim=2)                                  # (B, L, D)
-        log_magnitudes = log_sh.sum(dim=2) * alpha                   # tempered sum of logs
-
-        # stable exp: subtract the max over the hidden dim
-        log_magnitudes = log_magnitudes - log_magnitudes.amax(dim=-1, keepdim=True)
-
-        output = signs * torch.exp(log_magnitudes)
-        return output
+        #if DEBUGGING_PROJECTION:
+        #    print("vectors_to_compose.shape", vectors_to_compose.shape)
+        return torch.prod(vectors_to_compose, dim=2)#self.prod_with_shuf(vectors_to_compose)
 
         #    def prod_with_shuf(self, input_sequence):
         #        B, L, H, D = input_sequence.shape

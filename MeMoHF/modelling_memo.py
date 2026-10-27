@@ -37,6 +37,7 @@ import math
 VERBOSE = False
 #DEVICE = 'cpu'
 DEBUGGING = False
+DEBUGGING_PROJECTION = False
 
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
@@ -211,7 +212,7 @@ class MeMo(MeMoPreTrainedModel):
         self.chunk_length = chunk_length
         self.layerized_CMM_OUT = layerized_CMM_OUT
         self.lambda_val = 0.9 #0.5 #lambda_val
-
+        self.compositionOp = compositionOp
         self.padding_vector_component_values = padding_vector_component_values
         print("Padding input tokens in MeMo architecture: ", self.padding_vector_component_values)
         
@@ -225,24 +226,26 @@ class MeMo(MeMoPreTrainedModel):
                                      init_weights=init_weights, padding_vector_component_values=self.padding_vector_component_values)        #### FMZ 2026-07-01 - Encoding in
         self.output_encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, padding_seq_idx=padding_seq_idx, 
                                             init_weights=init_weights, padding_vector_component_values=0) #### FMZ 2026-07-01 - Encoding out ## if !=0 accuracy drop
+
         
-        if (compositionOp != CompositionOp.PROD and compositionOp != CompositionOp.PRODWITHSHUFFLING) or num_of_layers<= 3:
+
+        if (self.compositionOp != CompositionOp.PROD and self.compositionOp != CompositionOp.PRODWITHSHUFFLING) or self.l<= 3:
             self.layers = MeMoLayers(
                 [
-                    MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
-                    for i in range(num_of_layers)
+                    MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=self.compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
+                    for i in range(self.l)
                 ]
             )
         else:
             ## ESR hardcoded num of layers (3) for now, from exp results
              self.layers = MeMoLayers(
                 [
-                    MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
+                    MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=self.compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
                     for i in range(2)
                 ] + 
                 [
                     MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=CompositionOp.SUMTHENPRODWITHSHUFFLING, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
-                    for i in range(2, num_of_layers)
+                    for i in range(2, self.l)
                 ]
             )
 
@@ -412,7 +415,7 @@ class MeMo(MeMoPreTrainedModel):
         #    last_layer.directly_memorize(seq_encoding_for_the_last_layer)
 
         for layer_level in range(self.l):
-            if DEBUGGING:
+            if DEBUGGING_PROJECTION:
                 print("*"*80)
                 print(f"Layer {layer_level}")
             input_sequence = self.generate_sequences(input_seqs=input_sequence, layer=layer_level)
@@ -577,7 +580,7 @@ class MeMo(MeMoPreTrainedModel):
         #    #    print((retreived_output_symbol_vector, score_max))
 
         for layer_level in range(self.l):
-            if DEBUGGING:
+            if DEBUGGING_PROJECTION:
                 print("*"*80)
                 print(f"Layer {layer_level}")
             sequence_representation = self.generate_sequences(input_seqs=sequence_representation, layer=layer_level)
