@@ -37,7 +37,7 @@ import math
 VERBOSE = False
 #DEVICE = 'cpu'
 DEBUGGING = False
-DEBUGGING_PROJECTION = False
+DEBUGGING_PROJECTION = True
 
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
@@ -1903,4 +1903,3 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
     #         hidden_states=outputs.hidden_states,
     #         hidden_tokens=outputs.hidden_tokens,
     #     ), accuracy_results
-

@@ -39,7 +39,7 @@ class MeMoConfig(PretrainedConfig):
         pad_token_id=0,
         padding_seq_idx=-1,
         alpha_gen=1,
-        compositionOp='Prod', #choose between [Prod, JLT], case insensitive
+        compositionOp='Prod', # CompositionOp member name, case-insensitive
         padding_vector_component_values=0,
         **kwargs,
     ):
@@ -76,5 +76,4 @@ class MeMoConfig(PretrainedConfig):
                          eos_token_id=eos_token_id, 
                          pad_token_id=pad_token_id, **kwargs)
     
-
 

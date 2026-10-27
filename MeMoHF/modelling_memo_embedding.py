@@ -230,16 +230,24 @@ class MeMoEmbedding(Embedding):
                 self.weight[self.padding_idx].fill_(1)
 
     def _fill_padding_seq_idx_with_one(self) -> None:
-        if self.padding_vector_component_values != 'in_distribution':    # ESR 2026-09-03 padding token from the same distribution of other tokens
+        if self.padding_vector_component_values == 'circular_convolution_identity':
             with torch.no_grad():
-                    self.weight[self.padding_seq_idx].fill_(self.padding_vector_component_values)
+                self.weight[self.padding_idx].zero_()
+                self.weight[self.padding_idx, 0] = 1.0
+        elif self.padding_vector_component_values != 'in_distribution':    # ESR 2026-09-03 padding token from the same distribution of other tokens
+            with torch.no_grad():
+                self.weight[self.padding_seq_idx].fill_(self.padding_vector_component_values)
         else:
             print("Padding in distribution")
 
     #### FMZ 2026-07-01 
     def _fill_padding_idx_with_component_values(self) -> None:
         if self.padding_idx is not None:
-            if self.padding_vector_component_values != 'in_distribution': # ESR 2026-09-03 padding token from the same distribution of other tokens
+            if self.padding_vector_component_values == 'circular_convolution_identity':
+                with torch.no_grad():
+                    self.weight[self.padding_idx].zero_()
+                    self.weight[self.padding_idx, 0] = 1.0
+            elif self.padding_vector_component_values != 'in_distribution': # ESR 2026-09-03 padding token from the same distribution of other tokens
                 with torch.no_grad():
                     self.weight[self.padding_idx].fill_(self.padding_vector_component_values)
             else:

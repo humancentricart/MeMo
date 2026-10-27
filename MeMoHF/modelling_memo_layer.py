@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 
 DEBUGGING = False
-DEBUGGING_PROJECTION = False
+DEBUGGING_PROJECTION = True
 verbose = False
 
 
@@ -199,6 +199,7 @@ class CompositionOp(Enum):
     SUM = 3
     PRODWITHSHUFFLING = 4
     SUMTHENPRODWITHSHUFFLING = 5
+    SCC = 6
 
 
 class MeMoLayer(Module):
@@ -225,11 +226,21 @@ class MeMoLayer(Module):
             self.Prj = ProjectionSequence(self.d, self.d*self.h, init_weights=init_weights)
 
 
-        if self.compOp == CompositionOp.PRODWITHSHUFFLING or self.compOp == CompositionOp.SUMTHENPRODWITHSHUFFLING:
+        if self.compOp in (
+            CompositionOp.PRODWITHSHUFFLING,
+            CompositionOp.SUMTHENPRODWITHSHUFFLING,
+            CompositionOp.SCC,
+        ):
             # ESR 20/10/2026
             # this assigns the same permutation to each position!!
             #self.shuff = torch.randperm(self.d)
-            self.shuff = torch.stack([torch.randperm(self.d) for i in range(self.h)])
+
+            #self.shuff = torch.stack([torch.randperm(self.d) for i in range(self.h)])
+            # ESR 27/10/2026 registered shuff as buffer, so that pytorch loads it in gpu wo explicit handling
+            self.register_buffer(
+                "shuff",
+                torch.stack([torch.randperm(self.d) for _ in range(self.h)])
+            )
 
         ### ESR 2026-09-08 actually used only for "directly memorize"
         #CMM : correlation matrix memory for the specific layer
@@ -298,8 +309,15 @@ class MeMoLayer(Module):
             if DEBUGGING_PROJECTION:
                 self.inspect_tensor('output BEFOR NORM', sequence_encoding)
             sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
-            # print('sequence_encoding.shape', sequence_encoding.shape)
-            # print("average norm of sequence_encoding", torch.mean(torch.linalg.norm(sequence_encoding, dim=-1)))
+            if DEBUGGING_PROJECTION:
+                self.inspect_tensor('output', sequence_encoding)
+            return sequence_encoding, None
+
+        elif self.compOp == CompositionOp.SCC:
+            sequence_encoding = self.shuffled_circular_convolution(input_sequence)
+            if DEBUGGING_PROJECTION:
+                self.inspect_tensor('output BEFOR NORM', sequence_encoding)
+            #sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
             if DEBUGGING_PROJECTION:
                 self.inspect_tensor('output', sequence_encoding)
             return sequence_encoding, None
@@ -351,41 +369,31 @@ class MeMoLayer(Module):
     #     return acc
 
     # ESR 2026/10/20 reimplemented shuffled prod, 1 shuff per position!
+    # def prod_with_shuf(self, input_sequence):
+    #     B, L, H, D = input_sequence.shape
+
+    #     # Start from the last vector and apply its position-specific permutation
+    #     acc = input_sequence[:, :, -1, :]
+    #     acc = acc[..., self.shuff[H - 1]]
+
+    #     # Recursive composition with position-specific permutations
+    #     for i in range(H - 2, -1, -1):
+    #         acc = input_sequence[:, :, i, :] * acc
+    #         acc = acc[..., self.shuff[i]]
+
+    #     return acc
+
     def prod_with_shuf(self, input_sequence):
         B, L, H, D = input_sequence.shape
+        shuff = self.shuff.view(1, 1, H, D)
+        input_sequence = torch.gather(input_sequence, dim=-1, index=shuff.expand(B, L, H, D))
 
-        # Start from the last vector and apply its position-specific permutation
-        acc = input_sequence[:, :, -1, :]
-        acc = acc[..., self.shuff[H - 1]]
-
-        # Recursive composition with position-specific permutations
-        for i in range(H - 2, -1, -1):
-            acc = input_sequence[:, :, i, :] * acc
-            acc = acc[..., self.shuff[i]]
-
-        return acc
-
-    ### ESR is it collapsing many dimension to 0 for later layer
-    def prod_with_shuf_log(self, input_sequence, eps=1e-12):
-        B, L, H, D = input_sequence.shape
-
-        # log|x| and sign, handled separately (log is undefined for x <= 0)
-        log_x = torch.log(input_sequence.abs().clamp_min(eps))
-        sign_x = torch.sign(input_sequence)
-
-        log_acc = log_x[:, :, -1][:, :, self.shuff]
-        sign_acc = sign_x[:, :, -1][:, :, self.shuff]
-
-        for i in range(H - 2, -1, -1):
-            log_acc = (log_x[:, :, i] + log_acc)[:, :, self.shuff]    # sum of logs
-            sign_acc = (sign_x[:, :, i] * sign_acc)[:, :, self.shuff]
-
-        return sign_acc * torch.exp(log_acc)
+        return torch.prod(input_sequence,2)
 
     def sum_prod_with_shuf(self, input_sequence, bag_of_words_until=None, eps=1e-12):
         B, L, H, D = input_sequence.shape
-        for i in range(H):
-            input_sequence[:, :, i] = input_sequence[:, :, i, self.shuff[i]]
+        shuff = self.shuff.view(1, 1, H, D)
+        input_sequence = torch.gather(input_sequence, dim=-1, index=shuff.expand(B, L, H, D))
 
         if bag_of_words_until is None:
             bag_of_words_until = H - 1
@@ -424,6 +432,19 @@ class MeMoLayer(Module):
         #
         #                    sequence_encoding[b, l] = acc
         #        return sequence_encoding
+
+    def shuffled_circular_convolution(self, input_sequence: torch.Tensor) -> torch.Tensor:
+        B, L, H, D = input_sequence.shape
+        shuff = self.shuff.view(1, 1, H, D)
+        input_sequence = torch.gather(input_sequence, dim=-1, index=shuff.expand(B, L, H, D))
+
+        X = torch.fft.fft(input_sequence, dim=3)
+        X_prod = torch.prod(X, dim=2, keepdim=True)
+
+        z = torch.fft.ifft(X_prod, dim=3)
+
+        return torch.real(z).squeeze(dim=2)
+
 
     def penalize(self, sequence_encoding, seq_enc_per_token):
         # Penalizing factors to avoid multiple storage of the same sequence encoding in intermediate CMMs
