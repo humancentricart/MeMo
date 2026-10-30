@@ -541,14 +541,25 @@ class Arguments:
         self.eval_batch_size = eval_batch_size
         self.truncation = truncation
 
+        output_dir = "tracker_memo_trained"
+        os.makedirs(output_dir, exist_ok=True)
+        
         self.train_csv = (
-            train_csv or f"memo_trained_wiki_20_6_{compopdir}{config['h']}|{config['l']}_SHUFF_zanz8_1d.csv"
+            train_csv or f"{output_dir}/memo_trained_wiki_20_6_{compopdir}{config['h']}|{config['l']}_SHUFF_zanz8_1d.csv"
         )
+
+        output_dir = "results_ppl_train"
+        os.makedirs(output_dir, exist_ok=True)
+        
         self.eval_csv = (
-            eval_csv or f"memo_ppl_train_eval_wiki_20_6_{compopdir}{config['h']}|{config['l']}_SHUFF_zanz8_1d.csv"
+            eval_csv or f"{output_dir}/memo_ppl_train_eval_wiki_20_6_{compopdir}{config['h']}|{config['l']}_SHUFF_zanz8_1d.csv"
         )
+
+        output_dir = "results_mem_curve_eval"
+        os.makedirs(output_dir, exist_ok=True)
+
         self.mem_curve_eval_csv = (
-            mem_curve_eval_csv or f"mem_curve_eval_wiki_20_6_{compopdir}{config['h']}|{config['l']}_SHUFF_zanz8_1d.csv"
+            mem_curve_eval_csv or f"{output_dir}/mem_curve_eval_wiki_20_6_{compopdir}{config['h']}|{config['l']}_SHUFF_zanz8_1d.csv"
         )
 
 
