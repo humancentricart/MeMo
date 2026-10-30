@@ -519,6 +519,7 @@ class Arguments:
     def __init__(
         self,
         config,
+        compopdir,
         data_dir="./original_training_data/scaling_curve",
         train_custom_tokenizer=False,
         models_dir=None,
@@ -533,7 +534,7 @@ class Arguments:
         self.data_dir = data_dir
         self.train_custom_tokenizer = train_custom_tokenizer
         self.models_dir = (
-            models_dir or f"models_wiki_20_6_SCC{config['h']}|{config['l']}_SHUFF_zanz8_1d"
+            models_dir or f"models_wiki_20_6_{compopdir}{config['h']}|{config['l']}_SHUFF_zanz8_1d"
         )
         self.seeds = seeds if seeds is not None else [42]
         self.batch_size = batch_size
@@ -541,13 +542,13 @@ class Arguments:
         self.truncation = truncation
 
         self.train_csv = (
-            train_csv or f"memo_trained_wiki_20_6_SCC{config['h']}|{config['l']}_SHUFF_zanz8_1d.csv"
+            train_csv or f"memo_trained_wiki_20_6_{compopdir}{config['h']}|{config['l']}_SHUFF_zanz8_1d.csv"
         )
         self.eval_csv = (
-            eval_csv or f"memo_ppl_train_eval_wiki_20_6_SCC{config['h']}|{config['l']}_SHUFF_zanz8_1d.csv"
+            eval_csv or f"memo_ppl_train_eval_wiki_20_6_{compopdir}{config['h']}|{config['l']}_SHUFF_zanz8_1d.csv"
         )
         self.mem_curve_eval_csv = (
-            mem_curve_eval_csv or f"mem_curve_eval_wiki_20_6_SCC{config['h']}|{config['l']}_SHUFF_zanz8_1d.csv"
+            mem_curve_eval_csv or f"mem_curve_eval_wiki_20_6_{compopdir}{config['h']}|{config['l']}_SHUFF_zanz8_1d.csv"
         )
 
 
@@ -558,34 +559,40 @@ if __name__ == "__main__":
     lhs = {3: [4], 4:[4], 5: [4], 6: [4]}
     d = 4096
 
-
-    compositionOp='SCC'#'ProdWithShuffling',
-    padding_vector_component_values= {
+    padding_vector_component_values_d= {
         'ProdWithShuffling': 1/(d**(1/2)),
         'Prod': 1/(d**(1/2)), 
         'Sum': 0,
         'SCC': 'circular_convolution_identity'
     }
-    padding_vector_component_values = padding_vector_component_values[compositionOp]
+    compopdir_d = {
+        'ProdWithShuffling': 'sumshuffnormprod',
+        'SCC': 'SCC'
+    }
 
-    memo_configs = [
-        dict(
-            max_length=h**l,
-            d=d,
-            l=l,
-            h=h,
-            alpha_gen=1,
-            compositionOp=compositionOp,#compositionOp="prod",
-            padding_vector_component_values=padding_vector_component_values,
-        )
-        for l in lhs for h in lhs[l]
-    ]
+    for compositionOp in ['ProdWithShuffling', 'SCC']:
 
-    for config in memo_configs:
-        l = config["l"]
-        h = config["h"]
-        print(f"Running for l={l}, h={h}...")
+        padding_vector_component_values = padding_vector_component_values_d[compositionOp]
+        compopdir = compopdir_d[compositionOp]
 
-        params = Arguments(config, truncation=True)
+        memo_configs = [
+            dict(
+                max_length=h**l,
+                d=d,
+                l=l,
+                h=h,
+                alpha_gen=1,
+                compositionOp=compositionOp,#compositionOp="prod",
+                padding_vector_component_values=padding_vector_component_values,
+            )
+            for l in lhs for h in lhs[l]
+        ]
 
-        experimental_management(params, memo_configs=[config])
+        for config in memo_configs:
+            l = config["l"]
+            h = config["h"]
+            print(f"Running for l={l}, h={h}...")
+
+            params = Arguments(config, compopdir, truncation=True)
+
+            experimental_management(params, memo_configs=[config])
