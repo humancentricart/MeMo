@@ -31,6 +31,9 @@ LearningEvaluation/memo_*
 LearningEvaluation/models*/*
 LearningEvaluation/original_training_data/*
 LearningEvaluation/old_mem_curve/*
+LearningEvaluation/results_mem_curve_eval/*
+LearningEvaluation/results_ppl_train/*
+LearningEvaluation/tracker_memo_trained/*
 LearningEvaluation/LearningEvaluation/*
 
 # PyInstaller
