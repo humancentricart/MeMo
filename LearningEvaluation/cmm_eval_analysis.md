@@ -289,9 +289,9 @@ power_ratio-1 ~ (|v|^2)/ (E[|c|^2])
 In other words, `power_ratio-1` isolates the signal-to-crosstalk ratio.
 
 
-Substituting aboce, we have:
+Substituting above, we have:
 ```
-d_eff ~ (P-1)power_ratio
+d_eff ~ (P-1) power_ratio
 ```
 
 
@@ -311,3 +311,10 @@ d_eff ~ (P-1)power_ratio
 | `power_ratio` | `‖M k_stored‖^2 / ‖M k_unseen‖^2` | Unseen keys have no signal, so their recall is pure crosstalk. The ratio of stored to unseen power gives signal-to-crosstalk without needing targets. | Null model: `1 + d/P`. |
 | `d_eff_est` | `P · (power_ratio − 1)` | Estimated effective key dimension, the "room" the memory really has. | ≈ `d` means keys use all dimensions; much below `d` means correlated or low-rank keys; above `d` is not explained by key anisotropy. |
 | `fro2_per_pair` | `‖M‖^2_F / (P · mean‖v‖^2)` | Equals `1 + (1/(P·mean‖v‖^2)) Σ_{i!=j} (k_i·k_j)(v_i·v_j)`. Detects whether similar keys go with similar values. | ≈ 1: no systematic relation. > 1: similar keys carry similar values (redundant or consistent associations). < 1: similar keys carry opposite values (conflicts). |
+
+
+
+#### 1.4 Further analysis worth reading
+
+- Bound on the top-1 with high probability  https://arxiv.org/pdf/2605.05189
+- Analysis of feature correlations https://arxiv.org/html/2508.01395v1
