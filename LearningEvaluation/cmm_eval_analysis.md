@@ -318,3 +318,4 @@ d_eff ~ (P-1) power_ratio
 
 - Bound on the top-1 with high probability  https://arxiv.org/pdf/2605.05189
 - Analysis of feature correlations https://arxiv.org/html/2508.01395v1
+- Thesis with (maybe) hints on generalization: https://etheses.whiterose.ac.uk/id/eprint/2211/1/FinalSubmission.pdf
