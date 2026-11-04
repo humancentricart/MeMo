@@ -26,7 +26,8 @@ Disk layout (one folder per layer, one file pair per memorize() call)
     store = BatchStore("memo_dump", layer_level=2)
     ev = CMMSaturationEvaluator(layer, store, n_holdout_batches=2)
     rows = ev.sweep(default_checkpoints(ev.max_train_batches, n_points=8),
-                    n_eval=2000, n_fresh=2000, out_json="memo_dump/layer2_sweep.json")
+                    n_eval=2000, n_fresh=2000, topk=(1, 5, 10, 100),
+                    out_json="memo_dump/layer2_sweep.json")
     plot_sweep(rows, "memo_dump/layer2_sweep.png")
 
 A "pair" is one (key, value) at a position selected by to_save_sequences, so one
@@ -53,6 +54,12 @@ Whitening with the value covariance is NOT included: it drops out when values ar
 
 prior_smoothing = a in pi_c = (count_c + a) / (P + a*V). a = 1 is Laplace smoothing (unseen
 candidates keep some mass); a -> 0 restricts the decoder to candidates that were actually stored.
+
+Top-k accuracy
+--------------
+`topk` (evaluate / sweep) is a list of k values, e.g. (1, 5, 10, 100). For every decoder the
+result dict contains "top{k}" for each k (k = 1 is always included). If k exceeds the number of
+candidates V, it is clipped to V (accuracy is then trivially 1).
 """
 from __future__ import annotations
 
@@ -69,6 +76,17 @@ import torch
 import torch.nn.functional as F
 
 DECODER_NAMES = ("dot_T1", "bayes_T", "bayes_T_prior", "fit_T", "fit_T_prior")
+DEFAULT_TOPK = (1, 5, 10, 100)
+
+
+def _norm_ks(topk: Sequence[int]) -> List[int]:
+    """Sorted, de-duplicated list of k values; k = 1 is always included."""
+    if isinstance(topk, int):
+        topk = [topk]
+    ks = sorted({int(k) for k in topk} | {1})
+    if ks[0] < 1:
+        raise ValueError(f"all k in topk must be >= 1, got {list(topk)}")
+    return ks
 
 
 # --------------------------------------------------------------------------- #
@@ -309,7 +327,7 @@ class CandidateSet:
 
 
 class _TopK:
-    """Streaming top-k over candidate chunks."""
+    """Streaming top-k over candidate chunks. Requires k <= total number of candidates."""
 
     def __init__(self, n: int, k: int, device):
         self.k = k
@@ -494,12 +512,14 @@ class CMMSaturationEvaluator:
         return lse, tk
 
     @torch.no_grad()
-    def _decode(self, out, enc, v, true_ids, P, d, seed, prior_smoothing, chunk, n_beta):
+    def _decode(self, out, enc, v, true_ids, P, d, seed, prior_smoothing, chunk, n_beta,
+                topk=DEFAULT_TOPK):
         dev = out.device
         n, V = out.shape[0], self.cands.V
         if n < 8:
             return None
-        k = min(5, V)
+        ks = _norm_ks(topk)
+        k_max = min(max(ks), V)  # size of the streaming top-k buffer (never larger than V)
 
         # --- theoretical temperature: r = g*u_true + N(0, s2 I), s2 = ((P-1)/d) * sigma_v^2
         gamma = enc.pow(2).sum(-1).mean().item()
@@ -522,8 +542,7 @@ class CMMSaturationEvaluator:
         perm = torch.as_tensor(np.random.default_rng(seed + 7 + P).permutation(n), device=dev)
         folds = [perm[: n // 2], perm[n // 2:]]
         nll = {nm: torch.zeros(n, device=dev) for nm in DECODER_NAMES}
-        hit1 = {nm: torch.zeros(n, device=dev) for nm in DECODER_NAMES}
-        hit5 = {nm: torch.zeros(n, device=dev) for nm in DECODER_NAMES}
+        hits = {nm: {k: torch.zeros(n, device=dev) for k in ks} for nm in DECODER_NAMES}
         fit_np, fit_p = [], []
         for f in (0, 1):
             cal, ev = folds[f], folds[1 - f]
@@ -531,7 +550,7 @@ class CMMSaturationEvaluator:
                                        beta_th, n_beta, chunk)
             fit_np.append(b_np)
             fit_p.append(b_p)
-            lse, tk = self._eval_rows(out[ev], gamma, logprior, beta_th, b_np, b_p, chunk, k)
+            lse, tk = self._eval_rows(out[ev], gamma, logprior, beta_th, b_np, b_p, chunk, k_max)
             true_logit = {
                 "dot_T1": dot_true[ev],
                 "bayes_T": beta_th * S_true[ev],
@@ -546,22 +565,25 @@ class CMMSaturationEvaluator:
             t = true_ids[ev]
             for nm in DECODER_NAMES:
                 nll[nm][ev] = lse_of[nm] - true_logit[nm]
-                top = rank_of[nm].i
-                hit1[nm][ev] = (top[:, 0] == t).float()
-                hit5[nm][ev] = (top == t[:, None]).any(1).float()
+                top = rank_of[nm].i  # (n_ev, k_max), sorted by decreasing score
+                for k in ks:
+                    kk = min(k, k_max)
+                    hits[nm][k][ev] = (top[:, :kk] == t[:, None]).any(1).float()
 
-        # --- reference baselines
-        top_prior = logprior.topk(k).indices
-        prior_only = dict(
-            nll=float(-lp_true.mean()),
-            top1=float((true_ids == top_prior[0]).float().mean()),
-            top5=float((true_ids[:, None] == top_prior[None, :]).any(1).float().mean()),
-        )
+        # --- reference baselines (prior only)
+        top_prior = logprior.topk(k_max).indices
+        prior_only = dict(nll=float(-lp_true.mean()))
+        for k in ks:
+            kk = min(k, k_max)
+            prior_only[f"top{k}"] = float((true_ids[:, None] == top_prior[None, :kk]).any(1).float().mean())
+
         geo = lambda xs: float(math.exp(sum(math.log(x) for x in xs) / len(xs)))
         beta_fit, beta_fit_p = geo(fit_np), geo(fit_p)
-        decs = {nm: dict(nll=float(nll[nm].mean()), top1=float(hit1[nm].mean()),
-                         top5=float(hit5[nm].mean())) for nm in DECODER_NAMES}
+        decs = {nm: dict(nll=float(nll[nm].mean()),
+                         **{f"top{k}": float(hits[nm][k].mean()) for k in ks})
+                for nm in DECODER_NAMES}
         return dict(
+            topk=ks,
             n_candidates=int(V),
             n_distinct_stored=int((counts > 0).sum().item()),
             gamma=gamma,
@@ -579,7 +601,8 @@ class CMMSaturationEvaluator:
     @torch.no_grad()
     def evaluate(self, n_eval: int = 1000, n_fresh: int = 1000, seed: int = 0,
                  decode: bool = True, prior_smoothing: float = 1.0,
-                 vocab_chunk: int = 8192, n_beta: int = 21) -> Dict:
+                 vocab_chunk: int = 8192, n_beta: int = 21,
+                 topk: Sequence[int] = DEFAULT_TOPK) -> Dict:
         P, d, nb = self.n_pairs_stored, self.layer.d, self.n_batches_stored
         if nb == 0:
             raise ValueError("nothing memorized yet")
@@ -635,20 +658,22 @@ class CMMSaturationEvaluator:
         if decode:
             true_ids = torch.as_tensor(np.concatenate(id_l), device=self.device)
             row["dec"] = self._decode(out, enc, v, true_ids, P, d, seed,
-                                      prior_smoothing, vocab_chunk, n_beta)
+                                      prior_smoothing, vocab_chunk, n_beta, topk=topk)
         return row
 
     def sweep(self, checkpoints: Sequence[int], n_eval: int = 1000, n_fresh: int = 1000,
               out_json: Optional[str] = None, reset: bool = True, verbose: bool = True,
-              decode: bool = True, prior_smoothing: float = 1.0):
-        """checkpoints = numbers of batches to have memorized (see default_checkpoints)."""
+              decode: bool = True, prior_smoothing: float = 1.0,
+              topk: Sequence[int] = DEFAULT_TOPK):
+        """checkpoints = numbers of batches to have memorized (see default_checkpoints).
+        topk = list of k for which the top-k accuracy of every decoder is computed."""
         if reset:
             self.reset()
         rows = []
         for nb in sorted(checkpoints):
             self.memorize_batches(nb)
             r = self.evaluate(n_eval=n_eval, n_fresh=n_fresh, decode=decode,
-                              prior_smoothing=prior_smoothing)
+                              prior_smoothing=prior_smoothing, topk=topk)
             rows.append(r)
             if verbose:
                 print(f"batches={r['n_batches']:5d} P={r['P']:8d} alpha={r['alpha']:.3f}  "
@@ -658,11 +683,12 @@ class CMMSaturationEvaluator:
                 dd = r.get("dec")
                 if dd:
                     D = dd["decoders"]
+                    topk_str = " ".join(f"top{k}={D['fit_T_prior'][f'top{k}']:.3f}" for k in dd["topk"])
                     print(f"      NLL dot={D['dot_T1']['nll']:.2f} bayes={D['bayes_T']['nll']:.2f} "
                           f"bayes+prior={D['bayes_T_prior']['nll']:.2f} "
                           f"fit+prior={D['fit_T_prior']['nll']:.2f} "
                           f"(uniform {dd['nll_uniform']:.2f}, prior-only {dd['prior_only']['nll']:.2f})  "
-                          f"top1 fit+prior={D['fit_T_prior']['top1']:.3f}  "
+                          f"fit+prior: {topk_str}  "
                           f"beta_fit/theory={dd['beta_fit_prior'] / dd['beta_theory']:.2f}  "
                           f"V={dd['n_candidates']}")
         if out_json:
@@ -701,6 +727,7 @@ def plot_sweep(rows: List[Dict], path: Optional[str] = None):
     # ---- row 2: decoders ---------------------------------------------------
     if has_dec:
         a = axes[1]
+        ks = rows[0]["dec"]["topk"]
         dec = lambda nm, key: [r["dec"]["decoders"][nm][key] for r in rows]
         label = {"dot_T1": "dot product, T=1 (current)",
                  "bayes_T": "Bayes temperature",
@@ -722,15 +749,17 @@ def plot_sweep(rows: List[Dict], path: Optional[str] = None):
                  ylim=(0, 1.3 * max(max(nll_u), max(nll_pr))))
         a[0].legend(fontsize=7)
 
-        # (b) accuracy of the decoders
+        # (b) accuracy of the decoders (no random baseline; linear y axis to resolve values near 1)
         a[1].plot(P, [r["top1_acc"] for r in rows], "k:", label="top-1 cosine cleanup (stored bank)")
         a[1].plot(P, dec("dot_T1", "top1"), "x-", label="top-1 dot product")
         a[1].plot(P, dec("bayes_T", "top1"), "o--", label="top-1 Bayes / fitted T (no prior)")
         a[1].plot(P, dec("bayes_T_prior", "top1"), "o-", label="top-1 Bayes T + prior")
         a[1].plot(P, dec("fit_T_prior", "top1"), "s-", label="top-1 fitted T + prior")
-        a[1].plot(P, dec("fit_T_prior", "top5"), "s--", label="top-5 fitted T + prior")
-        a[1].plot(P, [r["dec"]["top1_chance"] for r in rows], "--", color="gray", label="chance (1/V)")
-        a[1].set(xscale="log", yscale="log", xlabel="stored pairs P", ylabel="accuracy")
+        for j, k in enumerate(k for k in ks if k > 1):
+            a[1].plot(P, dec("fit_T_prior", f"top{k}"), "s--", color=f"C{5 + j}",
+                      label=f"top-{k} fitted T + prior")
+        a[1].set(xscale="log", xlabel="stored pairs P", ylabel="accuracy")
+        a[1].set_ylim(top=1.01)  # lower limit is chosen automatically from the data
         a[1].legend(fontsize=7)
 
         # (c) inverse temperature: theory vs fitted
