@@ -26,7 +26,7 @@ Disk layout (one folder per layer, one file pair per memorize() call)
     store = BatchStore("memo_dump", layer_level=2)
     ev = CMMSaturationEvaluator(layer, store, n_holdout_batches=2)
     rows = ev.sweep(default_checkpoints(ev.max_train_batches, n_points=8),
-                    n_eval=2000, n_fresh=2000, topk=(1, 5, 10, 100),
+                    n_eval=2000, n_fresh=2000, topk=(1, 5, 10, 100), ridge=1e-3,
                     out_json="memo_dump/layer2_sweep.json")
     plot_sweep(rows, "memo_dump/layer2_sweep.png")
 
@@ -34,23 +34,42 @@ A "pair" is one (key, value) at a position selected by to_save_sequences, so one
 batch holds B * len(to_save_sequences) pairs. The last `n_holdout_batches` batches are
 never memorized; they provide unseen keys to measure pure crosstalk.
 
-3) DECODERS (new; on by default, disable with decode=False)
------------------------------------------------------------
+3) DECODERS (on by default, disable with decode=False)
+------------------------------------------------------
 The candidates ("vocabulary") are the DISTINCT value vectors found in the whole store
 (identified by exact equality); a decoder turns the recall r = M k into a distribution over
 them. Compared, per checkpoint:
 
-    dot_T1          logits = r . u_c                               (plain unembedding, T = 1)
-    bayes_T         logits = beta * (r . u_c - 0.5*g*|u_c|^2)      beta from theory (see below)
-    bayes_T_prior   bayes_T + log pi_c                             pi_c = smoothed stored frequency
-    fit_T           same as bayes_T, beta fitted by max likelihood (2-fold cross-fitting)
-    fit_T_prior     same as bayes_T_prior, beta fitted
+  Isotropic family (plain dot product geometry)
+    dot_T1            logits = r . u_c                                  (plain unembedding, T = 1)
+    bayes_T           logits = beta * (r . u_c - 0.5*g*|u_c|^2)         beta from theory (see below)
+    bayes_T_prior     bayes_T + log pi_c                                pi_c = smoothed stored frequency
+    fit_T             same as bayes_T, beta fitted by max likelihood (2-fold cross-fitting)
+    fit_T_prior       same as bayes_T_prior, beta fitted
 
-Theory: for unit-norm keys and isotropic values, r = g*u_true + N(0, s^2 I) with
+  Whitened family (NEW; for non-isotropic values, e.g. Zipf-distributed tokens)
+    white_T           logits = beta_w * (u_c^T C^-1 r - 0.5*g*u_c^T C^-1 u_c)    beta_w from theory
+    white_T_prior     white_T + log pi_c
+    fit_white_T       same as white_T, beta_w fitted
+    fit_white_T_prior same as white_T_prior, beta_w fitted
+
+Theory (isotropic): for unit-norm keys and isotropic values, r = g*u_true + N(0, s^2 I) with
 s^2 = ((P-1)/d) * sigma_v^2 (sigma_v^2 = per-component value variance), g = |k|^2 (~1), hence
 beta = g / s^2. The temperature only changes calibration (NLL), never the arg-max; only the prior
 (or the |u_c|^2 bias when candidate norms differ) can change the ranking.
-Whitening with the value covariance is NOT included: it drops out when values are isotropic.
+
+Theory (whitened): the crosstalk n = sum over the other P-1 stored pairs of (k_j . k_i) v_j has
+covariance alpha * C with alpha = (P-1)/d and C = (1/P) sum_j v_j v_j^T the second-moment matrix of
+the stored values. Then
+    log p(c | r) = beta_w * [u_c^T C^-1 r - 0.5 * g * u_c^T C^-1 u_c] + log pi_c + const,
+    beta_w = g / alpha
+which reduces to the isotropic decoder when C = sigma_v^2 I and all |u_c| are equal.
+C is computed EXACTLY from the stored counts, C = sum_c (count_c / P) u_c u_c^T, so it is cheap and
+needs no extra pass over pair data. It is ridge-regularised:
+    C_ridge = C + ridge * (tr C / d) * I
+(`ridge` is relative to the mean eigenvalue). If the number of distinct stored values is smaller than
+d, C is rank deficient and the ridge is essential; tune it (e.g. 1e-4 ... 1e-1) and look at
+`C_participation_ratio` in the results (effective rank of C: ~d if isotropic, small if low rank / Zipf).
 
 prior_smoothing = a in pi_c = (count_c + a) / (P + a*V). a = 1 is Laplace smoothing (unseen
 candidates keep some mass); a -> 0 restricts the decoder to candidates that were actually stored.
@@ -75,8 +94,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-DECODER_NAMES = ("dot_T1", "bayes_T", "bayes_T_prior", "fit_T", "fit_T_prior")
+DECODER_NAMES = ("dot_T1", "bayes_T", "bayes_T_prior", "fit_T", "fit_T_prior",
+                 "white_T", "white_T_prior", "fit_white_T", "fit_white_T_prior")
 DEFAULT_TOPK = (1, 5, 10, 100)
+DEFAULT_RIDGE = 1e-3
 
 
 def _norm_ks(topk: Sequence[int]) -> List[int]:
@@ -468,52 +489,96 @@ class CMMSaturationEvaluator:
         return np.bincount(ids, minlength=self.cands.V)
 
     @torch.no_grad()
-    def _fit_beta(self, out_c, S_true_c, lp_true_c, gamma, logprior, beta_th, n_beta, chunk):
-        """Grid search (+-3 octaves around the theoretical beta) of the inverse temperature that
-        minimises the NLL on the calibration rows, without and with the prior."""
-        dev = out_c.device
-        betas = beta_th * 2.0 ** torch.linspace(-3, 3, n_beta, device=dev)
-        n = out_c.shape[0]
-        lse_np = torch.full((n_beta, n), -float("inf"), device=dev)
-        lse_p = torch.full((n_beta, n), -float("inf"), device=dev)
-        for s, U, sq in self.cands.chunks(dev, out_c.dtype, chunk):
-            S = out_c @ U.T - 0.5 * gamma * sq
-            lp = logprior[s:s + U.shape[0]]
-            for k in range(n_beta):
-                Z = betas[k] * S
-                lse_np[k] = torch.logaddexp(lse_np[k], torch.logsumexp(Z, dim=1))
-                lse_p[k] = torch.logaddexp(lse_p[k], torch.logsumexp(Z + lp, dim=1))
-        nll_np = (lse_np - betas[:, None] * S_true_c[None]).mean(1)
-        nll_p = (lse_p - betas[:, None] * S_true_c[None] - lp_true_c[None]).mean(1)
-        return betas[nll_np.argmin()].item(), betas[nll_p.argmin()].item()
+    def _whitener(self, counts: torch.Tensor, d: int, ridge: float, dtype, chunk: int):
+        """Ridge-regularised inverse of C = sum_c (count_c / P) u_c u_c^T, computed exactly from the
+        stored counts (float64 accumulation). Returns (C^-1 in `dtype`, diagnostics)."""
+        dev = counts.device
+        w = counts / counts.sum()
+        C = torch.zeros(d, d, dtype=torch.float64, device=dev)
+        for s, U, _ in self.cands.chunks(dev, dtype, chunk):
+            Ud = U.double()
+            C += Ud.T @ (w[s:s + U.shape[0], None] * Ud)
+        C = 0.5 * (C + C.T)
+        tr = C.diagonal().sum()
+        lam = ridge * tr / d
+        Cinv = torch.linalg.inv(C + lam * torch.eye(d, dtype=torch.float64, device=dev))
+        Cinv = 0.5 * (Cinv + Cinv.T)
+        info = dict(C_trace=float(tr),
+                    C_participation_ratio=float(tr ** 2 / C.pow(2).sum().clamp_min(1e-300)),
+                    ridge_abs=float(lam))
+        return Cinv.to(dtype), info
 
     @torch.no_grad()
-    def _eval_rows(self, out_e, gamma, logprior, beta_th, b_np, b_p, chunk, k):
-        """One streaming pass over the candidates: log-normalisers and top-k for every decoder."""
+    def _fit_beta(self, out_c, S_true_c, Sw_true_c, lp_true_c, gamma, logprior, Cinv,
+                  beta_th, beta_w, n_beta, chunk):
+        """Grid search (+-3 octaves around the theoretical beta) of the inverse temperature that
+        minimises the NLL on the calibration rows, without and with the prior, for both the
+        plain and the whitened score. Returns dict with keys np, p, wnp, wp."""
+        dev = out_c.device
+        grid = 2.0 ** torch.linspace(-3, 3, n_beta, device=dev)
+        bp, bw = beta_th * grid, beta_w * grid
+        n = out_c.shape[0]
+        lse = {key: torch.full((n_beta, n), -float("inf"), device=dev)
+               for key in ("np", "p", "wnp", "wp")}
+        for s, U, sq in self.cands.chunks(dev, out_c.dtype, chunk):
+            S = out_c @ U.T - 0.5 * gamma * sq
+            Uw = U @ Cinv
+            Sw = out_c @ Uw.T - 0.5 * gamma * (Uw * U).sum(-1)
+            lp = logprior[s:s + U.shape[0]]
+            for k in range(n_beta):
+                Z, Zw = bp[k] * S, bw[k] * Sw
+                lse["np"][k] = torch.logaddexp(lse["np"][k], torch.logsumexp(Z, dim=1))
+                lse["p"][k] = torch.logaddexp(lse["p"][k], torch.logsumexp(Z + lp, dim=1))
+                lse["wnp"][k] = torch.logaddexp(lse["wnp"][k], torch.logsumexp(Zw, dim=1))
+                lse["wp"][k] = torch.logaddexp(lse["wp"][k], torch.logsumexp(Zw + lp, dim=1))
+        nll_np = (lse["np"] - bp[:, None] * S_true_c[None]).mean(1)
+        nll_p = (lse["p"] - bp[:, None] * S_true_c[None] - lp_true_c[None]).mean(1)
+        nll_wnp = (lse["wnp"] - bw[:, None] * Sw_true_c[None]).mean(1)
+        nll_wp = (lse["wp"] - bw[:, None] * Sw_true_c[None] - lp_true_c[None]).mean(1)
+        return dict(np=bp[nll_np.argmin()].item(), p=bp[nll_p.argmin()].item(),
+                    wnp=bw[nll_wnp.argmin()].item(), wp=bw[nll_wp.argmin()].item())
+
+    @torch.no_grad()
+    def _eval_rows(self, out_e, gamma, logprior, Cinv, bt, chunk, k):
+        """One streaming pass over the candidates: log-normalisers and top-k for every decoder.
+        bt = dict(th, np, p, w_th, w_np, w_p) of inverse temperatures."""
         dev, n = out_e.device, out_e.shape[0]
-        lse = {nm: torch.full((n,), -float("inf"), device=dev)
-               for nm in ("dot", "th", "th_p", "fit", "fit_p")}
-        tk = {nm: _TopK(n, k, dev) for nm in ("dot", "S", "th_p", "fit_p")}
+        names = ("dot", "th", "th_p", "fit", "fit_p", "wth", "wth_p", "wfit", "wfit_p")
+        lse = {nm: torch.full((n,), -float("inf"), device=dev) for nm in names}
+        tk = {nm: _TopK(n, k, dev) for nm in ("dot", "S", "th_p", "fit_p", "Sw", "wth_p", "wfit_p")}
+
+        def acc(nm, z):
+            lse[nm] = torch.logaddexp(lse[nm], torch.logsumexp(z, 1))
+
         for s, U, sq in self.cands.chunks(dev, out_e.dtype, chunk):
             dot = out_e @ U.T
             S = dot - 0.5 * gamma * sq
+            Uw = U @ Cinv
+            Sw = out_e @ Uw.T - 0.5 * gamma * (Uw * U).sum(-1)
             lp = logprior[s:s + U.shape[0]]
-            Zth_p = beta_th * S + lp
-            Zfit_p = b_p * S + lp
-            lse["dot"] = torch.logaddexp(lse["dot"], torch.logsumexp(dot, 1))
-            lse["th"] = torch.logaddexp(lse["th"], torch.logsumexp(beta_th * S, 1))
-            lse["th_p"] = torch.logaddexp(lse["th_p"], torch.logsumexp(Zth_p, 1))
-            lse["fit"] = torch.logaddexp(lse["fit"], torch.logsumexp(b_np * S, 1))
-            lse["fit_p"] = torch.logaddexp(lse["fit_p"], torch.logsumexp(Zfit_p, 1))
+            Zth_p, Zfit_p = bt["th"] * S + lp, bt["p"] * S + lp
+            Zwth_p, Zwfit_p = bt["w_th"] * Sw + lp, bt["w_p"] * Sw + lp
+            acc("dot", dot)
+            acc("th", bt["th"] * S)
+            acc("th_p", Zth_p)
+            acc("fit", bt["np"] * S)
+            acc("fit_p", Zfit_p)
+            acc("wth", bt["w_th"] * Sw)
+            acc("wth_p", Zwth_p)
+            acc("wfit", bt["w_np"] * Sw)
+            acc("wfit_p", Zwfit_p)
             tk["dot"].update(dot, s)
             tk["S"].update(S, s)
             tk["th_p"].update(Zth_p, s)
             tk["fit_p"].update(Zfit_p, s)
+            tk["Sw"].update(Sw, s)
+            tk["wth_p"].update(Zwth_p, s)
+            tk["wfit_p"].update(Zwfit_p, s)
         return lse, tk
 
     @torch.no_grad()
     def _decode(self, out, enc, v, true_ids, P, d, seed, prior_smoothing, chunk, n_beta,
-                topk=DEFAULT_TOPK):
+                topk=DEFAULT_TOPK, ridge=DEFAULT_RIDGE):
         dev = out.device
         n, V = out.shape[0], self.cands.V
         if n < 8:
@@ -521,21 +586,30 @@ class CMMSaturationEvaluator:
         ks = _norm_ks(topk)
         k_max = min(max(ks), V)  # size of the streaming top-k buffer (never larger than V)
 
-        # --- theoretical temperature: r = g*u_true + N(0, s2 I), s2 = ((P-1)/d) * sigma_v^2
+        # --- theoretical temperature (isotropic): r = g*u_true + N(0, s2 I), s2 = ((P-1)/d) * sigma_v^2
         gamma = enc.pow(2).sum(-1).mean().item()
         sigma2 = v.pow(2).sum(-1).mean().item() / d
         s2 = max((P - 1) / d * sigma2, 1e-12)
         beta_th = gamma / s2
+
+        # --- theoretical temperature (whitened): noise covariance = alpha * C, alpha = (P-1)/d
+        alpha = max((P - 1) / d, 1e-12)
+        beta_w = gamma / alpha
 
         # --- prior from what was actually memorized
         counts = torch.as_tensor(self._stored_counts(), device=dev, dtype=torch.float64)
         a = prior_smoothing
         logprior = torch.log((counts + a) / (counts.sum() + a * V)).to(out.dtype)
 
+        # --- whitening matrix C^-1 (ridge-regularised), exact from the stored counts
+        Cinv, c_info = self._whitener(counts, d, ridge, out.dtype, chunk)
+
         # --- quantities of the true candidate
         U_true = self.cands.vecs[true_ids.cpu()].to(dev, out.dtype)
         dot_true = (out * U_true).sum(-1)
         S_true = dot_true - 0.5 * gamma * U_true.pow(2).sum(-1)
+        Uw_true = U_true @ Cinv
+        Sw_true = (out * Uw_true).sum(-1) - 0.5 * gamma * (Uw_true * U_true).sum(-1)
         lp_true = logprior[true_ids]
 
         # --- 2-fold cross-fitting: beta fitted on one half, decoders scored on the other half
@@ -543,25 +617,34 @@ class CMMSaturationEvaluator:
         folds = [perm[: n // 2], perm[n // 2:]]
         nll = {nm: torch.zeros(n, device=dev) for nm in DECODER_NAMES}
         hits = {nm: {k: torch.zeros(n, device=dev) for k in ks} for nm in DECODER_NAMES}
-        fit_np, fit_p = [], []
+        fits = {key: [] for key in ("np", "p", "wnp", "wp")}
         for f in (0, 1):
             cal, ev = folds[f], folds[1 - f]
-            b_np, b_p = self._fit_beta(out[cal], S_true[cal], lp_true[cal], gamma, logprior,
-                                       beta_th, n_beta, chunk)
-            fit_np.append(b_np)
-            fit_p.append(b_p)
-            lse, tk = self._eval_rows(out[ev], gamma, logprior, beta_th, b_np, b_p, chunk, k_max)
+            fb = self._fit_beta(out[cal], S_true[cal], Sw_true[cal], lp_true[cal], gamma, logprior,
+                                Cinv, beta_th, beta_w, n_beta, chunk)
+            for key in fits:
+                fits[key].append(fb[key])
+            bt = dict(th=beta_th, np=fb["np"], p=fb["p"], w_th=beta_w, w_np=fb["wnp"], w_p=fb["wp"])
+            lse, tk = self._eval_rows(out[ev], gamma, logprior, Cinv, bt, chunk, k_max)
             true_logit = {
                 "dot_T1": dot_true[ev],
                 "bayes_T": beta_th * S_true[ev],
                 "bayes_T_prior": beta_th * S_true[ev] + lp_true[ev],
-                "fit_T": b_np * S_true[ev],
-                "fit_T_prior": b_p * S_true[ev] + lp_true[ev],
+                "fit_T": fb["np"] * S_true[ev],
+                "fit_T_prior": fb["p"] * S_true[ev] + lp_true[ev],
+                "white_T": beta_w * Sw_true[ev],
+                "white_T_prior": beta_w * Sw_true[ev] + lp_true[ev],
+                "fit_white_T": fb["wnp"] * Sw_true[ev],
+                "fit_white_T_prior": fb["wp"] * Sw_true[ev] + lp_true[ev],
             }
             lse_of = {"dot_T1": lse["dot"], "bayes_T": lse["th"], "bayes_T_prior": lse["th_p"],
-                      "fit_T": lse["fit"], "fit_T_prior": lse["fit_p"]}
+                      "fit_T": lse["fit"], "fit_T_prior": lse["fit_p"],
+                      "white_T": lse["wth"], "white_T_prior": lse["wth_p"],
+                      "fit_white_T": lse["wfit"], "fit_white_T_prior": lse["wfit_p"]}
             rank_of = {"dot_T1": tk["dot"], "bayes_T": tk["S"], "bayes_T_prior": tk["th_p"],
-                       "fit_T": tk["S"], "fit_T_prior": tk["fit_p"]}
+                       "fit_T": tk["S"], "fit_T_prior": tk["fit_p"],
+                       "white_T": tk["Sw"], "white_T_prior": tk["wth_p"],
+                       "fit_white_T": tk["Sw"], "fit_white_T_prior": tk["wfit_p"]}
             t = true_ids[ev]
             for nm in DECODER_NAMES:
                 nll[nm][ev] = lse_of[nm] - true_logit[nm]
@@ -578,22 +661,27 @@ class CMMSaturationEvaluator:
             prior_only[f"top{k}"] = float((true_ids[:, None] == top_prior[None, :kk]).any(1).float().mean())
 
         geo = lambda xs: float(math.exp(sum(math.log(x) for x in xs) / len(xs)))
-        beta_fit, beta_fit_p = geo(fit_np), geo(fit_p)
         decs = {nm: dict(nll=float(nll[nm].mean()),
                          **{f"top{k}": float(hits[nm][k].mean()) for k in ks})
                 for nm in DECODER_NAMES}
         return dict(
             topk=ks,
+            ridge=ridge,
             n_candidates=int(V),
             n_distinct_stored=int((counts > 0).sum().item()),
             gamma=gamma,
             beta_theory=float(beta_th),
-            beta_fit=beta_fit,
-            beta_fit_prior=beta_fit_p,
+            beta_fit=geo(fits["np"]),
+            beta_fit_prior=geo(fits["p"]),
+            beta_theory_white=float(beta_w),
+            beta_fit_white=geo(fits["wnp"]),
+            beta_fit_white_prior=geo(fits["wp"]),
+            **c_info,  # C_trace, C_participation_ratio, ridge_abs
             nll_uniform=float(math.log(V)),
             top1_chance=1.0 / V,
             prior_only=prior_only,
             info_from_memory_nats=prior_only["nll"] - decs["fit_T_prior"]["nll"],
+            info_from_memory_nats_white=prior_only["nll"] - decs["fit_white_T_prior"]["nll"],
             decoders=decs,
         )
 
@@ -602,7 +690,7 @@ class CMMSaturationEvaluator:
     def evaluate(self, n_eval: int = 1000, n_fresh: int = 1000, seed: int = 0,
                  decode: bool = True, prior_smoothing: float = 1.0,
                  vocab_chunk: int = 8192, n_beta: int = 21,
-                 topk: Sequence[int] = DEFAULT_TOPK) -> Dict:
+                 topk: Sequence[int] = DEFAULT_TOPK, ridge: float = DEFAULT_RIDGE) -> Dict:
         P, d, nb = self.n_pairs_stored, self.layer.d, self.n_batches_stored
         if nb == 0:
             raise ValueError("nothing memorized yet")
@@ -658,22 +746,24 @@ class CMMSaturationEvaluator:
         if decode:
             true_ids = torch.as_tensor(np.concatenate(id_l), device=self.device)
             row["dec"] = self._decode(out, enc, v, true_ids, P, d, seed,
-                                      prior_smoothing, vocab_chunk, n_beta, topk=topk)
+                                      prior_smoothing, vocab_chunk, n_beta,
+                                      topk=topk, ridge=ridge)
         return row
 
     def sweep(self, checkpoints: Sequence[int], n_eval: int = 1000, n_fresh: int = 1000,
               out_json: Optional[str] = None, reset: bool = True, verbose: bool = True,
               decode: bool = True, prior_smoothing: float = 1.0,
-              topk: Sequence[int] = DEFAULT_TOPK):
+              topk: Sequence[int] = DEFAULT_TOPK, ridge: float = DEFAULT_RIDGE):
         """checkpoints = numbers of batches to have memorized (see default_checkpoints).
-        topk = list of k for which the top-k accuracy of every decoder is computed."""
+        topk  = list of k for which the top-k accuracy of every decoder is computed.
+        ridge = relative ridge of the whitening matrix (see module docstring)."""
         if reset:
             self.reset()
         rows = []
         for nb in sorted(checkpoints):
             self.memorize_batches(nb)
             r = self.evaluate(n_eval=n_eval, n_fresh=n_fresh, decode=decode,
-                              prior_smoothing=prior_smoothing, topk=topk)
+                              prior_smoothing=prior_smoothing, topk=topk, ridge=ridge)
             rows.append(r)
             if verbose:
                 print(f"batches={r['n_batches']:5d} P={r['P']:8d} alpha={r['alpha']:.3f}  "
@@ -683,14 +773,18 @@ class CMMSaturationEvaluator:
                 dd = r.get("dec")
                 if dd:
                     D = dd["decoders"]
-                    topk_str = " ".join(f"top{k}={D['fit_T_prior'][f'top{k}']:.3f}" for k in dd["topk"])
+                    tk_p = " ".join(f"{k}:{D['fit_T_prior'][f'top{k}']:.3f}" for k in dd["topk"])
+                    tk_w = " ".join(f"{k}:{D['fit_white_T_prior'][f'top{k}']:.3f}" for k in dd["topk"])
                     print(f"      NLL dot={D['dot_T1']['nll']:.2f} bayes={D['bayes_T']['nll']:.2f} "
                           f"bayes+prior={D['bayes_T_prior']['nll']:.2f} "
-                          f"fit+prior={D['fit_T_prior']['nll']:.2f} "
-                          f"(uniform {dd['nll_uniform']:.2f}, prior-only {dd['prior_only']['nll']:.2f})  "
-                          f"fit+prior: {topk_str}  "
-                          f"beta_fit/theory={dd['beta_fit_prior'] / dd['beta_theory']:.2f}  "
-                          f"V={dd['n_candidates']}")
+                          f"fit+prior={D['fit_T_prior']['nll']:.2f} | "
+                          f"white={D['white_T']['nll']:.2f} white+prior={D['white_T_prior']['nll']:.2f} "
+                          f"fit_white+prior={D['fit_white_T_prior']['nll']:.2f} "
+                          f"(uniform {dd['nll_uniform']:.2f}, prior-only {dd['prior_only']['nll']:.2f})")
+                    print(f"      top-k fit+prior: {tk_p}  |  top-k fit_white+prior: {tk_w}  "
+                          f"beta_fit/theory={dd['beta_fit_prior'] / dd['beta_theory']:.2f} "
+                          f"(white {dd['beta_fit_white_prior'] / dd['beta_theory_white']:.2f})  "
+                          f"V={dd['n_candidates']}  PR(C)={dd['C_participation_ratio']:.1f}")
         if out_json:
             Path(out_json).parent.mkdir(parents=True, exist_ok=True)
             Path(out_json).write_text(json.dumps(rows, indent=2))
@@ -733,42 +827,58 @@ def plot_sweep(rows: List[Dict], path: Optional[str] = None):
                  "bayes_T": "Bayes temperature",
                  "bayes_T_prior": "Bayes temperature + prior",
                  "fit_T": "fitted temperature",
-                 "fit_T_prior": "fitted temperature + prior"}
-        sty = {"dot_T1": "x-", "bayes_T": "o--", "bayes_T_prior": "o-", "fit_T": "s--", "fit_T_prior": "s-"}
+                 "fit_T_prior": "fitted temperature + prior",
+                 "white_T": "whitened, Bayes temperature",
+                 "white_T_prior": "whitened, Bayes temperature + prior",
+                 "fit_white_T": "whitened, fitted temperature",
+                 "fit_white_T_prior": "whitened, fitted temperature + prior"}
+        sty = {"dot_T1": "x-", "bayes_T": "o--", "bayes_T_prior": "o-", "fit_T": "s--", "fit_T_prior": "s-",
+               "white_T": "^--", "white_T_prior": "^-", "fit_white_T": "v--", "fit_white_T_prior": "v-"}
+        col = {"dot_T1": "C0", "bayes_T": "C1", "bayes_T_prior": "C2", "fit_T": "C3", "fit_T_prior": "C4",
+               "white_T": "C5", "white_T_prior": "C6", "fit_white_T": "C8", "fit_white_T_prior": "C9"}
 
         # (a) negative log-likelihood
         for nm in DECODER_NAMES:
-            a[0].plot(P, dec(nm, "nll"), sty[nm], label=label[nm])
+            a[0].plot(P, dec(nm, "nll"), sty[nm], color=col[nm], label=label[nm])
         nll_u = [r["dec"]["nll_uniform"] for r in rows]
         nll_pr = [r["dec"]["prior_only"]["nll"] for r in rows]
         a[0].plot(P, nll_u, ":", color="gray", label="uniform (log V)")
         a[0].plot(P, nll_pr, "--", color="k", label="prior only")
-        a[0].fill_between(P, dec("fit_T_prior", "nll"), nll_pr, color="C4", alpha=0.15,
-                          label="information from memory")
+        a[0].fill_between(P, dec("fit_white_T_prior", "nll"), nll_pr, color="C9", alpha=0.12,
+                          label="information from memory (whitened)")
         a[0].set(xscale="log", xlabel="stored pairs P", ylabel="NLL of the true value (nats)",
                  ylim=(0, 1.3 * max(max(nll_u), max(nll_pr))))
-        a[0].legend(fontsize=7)
+        a[0].legend(fontsize=6)
 
         # (b) accuracy of the decoders (no random baseline; linear y axis to resolve values near 1)
         a[1].plot(P, [r["top1_acc"] for r in rows], "k:", label="top-1 cosine cleanup (stored bank)")
-        a[1].plot(P, dec("dot_T1", "top1"), "x-", label="top-1 dot product")
-        a[1].plot(P, dec("bayes_T", "top1"), "o--", label="top-1 Bayes / fitted T (no prior)")
-        a[1].plot(P, dec("bayes_T_prior", "top1"), "o-", label="top-1 Bayes T + prior")
-        a[1].plot(P, dec("fit_T_prior", "top1"), "s-", label="top-1 fitted T + prior")
-        for j, k in enumerate(k for k in ks if k > 1):
-            a[1].plot(P, dec("fit_T_prior", f"top{k}"), "s--", color=f"C{5 + j}",
+        for nm in ("dot_T1", "bayes_T", "bayes_T_prior", "fit_T_prior",
+                   "white_T", "white_T_prior", "fit_white_T_prior"):
+            a[1].plot(P, dec(nm, "top1"), sty[nm], color=col[nm], label=f"top-1 {label[nm]}")
+        ks_gt1 = [k for k in ks if k > 1]
+        kcols = plt.cm.plasma(np.linspace(0.1, 0.8, max(len(ks_gt1), 1)))
+        for k, kc in zip(ks_gt1, kcols):
+            a[1].plot(P, dec("fit_T_prior", f"top{k}"), "s--", color=kc, alpha=0.8,
                       label=f"top-{k} fitted T + prior")
+            a[1].plot(P, dec("fit_white_T_prior", f"top{k}"), "v-", color=kc,
+                      label=f"top-{k} whitened, fitted T + prior")
         a[1].set(xscale="log", xlabel="stored pairs P", ylabel="accuracy")
         a[1].set_ylim(top=1.01)  # lower limit is chosen automatically from the data
-        a[1].legend(fontsize=7)
+        a[1].legend(fontsize=5)
 
         # (c) inverse temperature: theory vs fitted
-        a[2].plot(P, [r["dec"]["beta_theory"] for r in rows], "--", label=r"theory $\gamma/s^2$")
-        a[2].plot(P, [r["dec"]["beta_fit"] for r in rows], "o-", label="fitted (no prior)")
-        a[2].plot(P, [r["dec"]["beta_fit_prior"] for r in rows], "s-", label="fitted (with prior)")
+        a[2].plot(P, [r["dec"]["beta_theory"] for r in rows], "--", color="C0", label=r"theory $\gamma/s^2$")
+        a[2].plot(P, [r["dec"]["beta_fit"] for r in rows], "o-", color="C1", label="fitted (no prior)")
+        a[2].plot(P, [r["dec"]["beta_fit_prior"] for r in rows], "s-", color="C2", label="fitted (with prior)")
+        a[2].plot(P, [r["dec"]["beta_theory_white"] for r in rows], "--", color="C5",
+                  label=r"whitened theory $\gamma/\alpha$")
+        a[2].plot(P, [r["dec"]["beta_fit_white"] for r in rows], "^-", color="C8",
+                  label="whitened fitted (no prior)")
+        a[2].plot(P, [r["dec"]["beta_fit_white_prior"] for r in rows], "v-", color="C9",
+                  label="whitened fitted (with prior)")
         a[2].set(xscale="log", yscale="log", xlabel="stored pairs P",
                  ylabel=r"inverse temperature $\beta$")
-        a[2].legend(fontsize=8)
+        a[2].legend(fontsize=7)
 
     fig.tight_layout()
     if path:

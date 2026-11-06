@@ -3,7 +3,7 @@ import json
 import os
 import re
 import warnings
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Sequence
 
 from tqdm import tqdm
 
@@ -80,6 +80,7 @@ class MeMoModelOutputWithPast(ModelOutput):
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     hidden_tokens: Optional[Tuple[torch.FloatTensor, ...]] = None
+    raw_recall_unpacked: Optional[torch.FloatTensor] = None
 
 
 @dataclass
@@ -117,7 +118,9 @@ class MeMoCausalLMOutputWithPast(ModelOutput):
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     hidden_tokens: Optional[Tuple[torch.FloatTensor, ...]] = None
-    
+    decoder_probs: Optional[Dict[str, torch.Tensor]] = None      # NEW name -> (B, T, V) probabilities
+    decoder_log_probs: Optional[Dict[str, torch.Tensor]] = None  # NEW same, log-probabilities (optional)
+    decoder_info: Optional[Dict[str, torch.Tensor]] = None       # NEW per-layer weights, load, temperature
 
 
 class MeMoLayers(ModuleList):
@@ -157,7 +160,20 @@ class MeMoPreTrainedModel(PreTrainedModel):
     def reset_parameters(self):
         pass
         
-
+ 
+# Decoders compared at the model level (see the analysis document, section 3).
+# Each one gives, for every layer, logits over the vocabulary from the RAW recall r = M k;
+# the per-layer logits are then pooled with the same layer weights as the legacy decoder.
+#   legacy         : normalized recall, plain dot product, top-100 zero-masking (the previous behaviour)
+#   dot_T1         : u_c . r                                         (raw recall, no mask, T = 1)
+#   bayes_T        : beta_th * (u_c . r - 0.5*gamma*|u_c|^2)         theoretical temperature
+#   bayes_T_prior  : bayes_T + log pi_c                              prior from the layer's token counts
+#   fit_T          : same as bayes_T with the layer's fitted beta_scale (plain, no prior)
+#   fit_T_prior    : same as bayes_T_prior with the layer's fitted beta_scale (plain, prior)
+# fit_* coincide with bayes_* until MeMoLayer.set_beta_scale(...) is called with the fitted ratio.
+DECODER_NAMES = ("dot_T1", "bayes_T", "bayes_T_prior", "fit_T", "fit_T_prior")
+ 
+ 
 class MeMo(MeMoPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -172,14 +188,15 @@ class MeMo(MeMoPreTrainedModel):
             padding_seq_idx=config.padding_seq_idx, 
             init_weights=False, ## disable the initialization of weights from the constructor (done in the post_init)
             compositionOp = CompositionOp[config.compositionOp.upper()],
-            padding_vector_component_values=config.padding_vector_component_values if config.padding_vector_component_values is not None else 0
+            padding_vector_component_values=config.padding_vector_component_values if config.padding_vector_component_values is not None else 0,
+            prior_smoothing=getattr(config, "prior_smoothing", 1.0),
         )
         
         self.gradient_checkpointing = False
         
         # Initialize weights and apply final processing --> init_weights --> _init_weights
         self.post_init() 
-
+ 
     
     def _build_model(self, 
                 inner_dim, 
@@ -194,6 +211,7 @@ class MeMo(MeMoPreTrainedModel):
                 compositionOp=CompositionOp.PROD,
                 padding_vector_component_values=0,
                 lambda_val=0.9,
+                prior_smoothing=1.0,
         ): 
         
         self.d = inner_dim
@@ -211,13 +229,17 @@ class MeMo(MeMoPreTrainedModel):
                                      init_weights=init_weights, padding_vector_component_values=self.padding_vector_component_values)        #### FMZ 2026-07-01 - Encoding in
         self.output_encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, padding_seq_idx=padding_seq_idx, 
                                             init_weights=init_weights, padding_vector_component_values=0) #### FMZ 2026-07-01 - Encoding out ## if !=0 accuracy drop
-
-        
-
+ 
+        # every layer keeps the statistics of what it stores (prior = token counts over the
+        # num_embeddings possible values, load, key/value norms) used by the Bayes decoders
+        def make_layer(op):
+            return MeMoLayer(self.d, self.h, init_weights=init_weights, compositionOp=op,
+                             num_embeddings=num_embeddings, prior_smoothing=prior_smoothing)
+ 
         if (self.compositionOp != CompositionOp.PROD and self.compositionOp != CompositionOp.PRODWITHSHUFFLING) or self.l<= 3:
             self.layers = MeMoLayers(
                 [
-                    MeMoLayer(self.d, self.h, init_weights=init_weights, compositionOp=self.compositionOp) 
+                    make_layer(self.compositionOp) 
                     for i in range(self.l)
                 ]
             )
@@ -225,22 +247,22 @@ class MeMo(MeMoPreTrainedModel):
             ## ESR hardcoded num of layers (3) for now, from exp results
              self.layers = MeMoLayers(
                 [
-                    MeMoLayer(self.d, self.h, init_weights=init_weights, compositionOp=self.compositionOp) 
+                    make_layer(self.compositionOp) 
                     for i in range(2)
                 ] + 
                 [
-                    MeMoLayer(self.d, self.h, init_weights=init_weights, compositionOp=CompositionOp.SUMTHENPRODWITHSHUFFLING) 
+                    make_layer(CompositionOp.SUMTHENPRODWITHSHUFFLING) 
                     for i in range(2, self.l)
                 ]
             )
-
+ 
     def generate_sequences(self, input_seqs, layer: int):
-
+ 
         h = self.h
         batch_size, seq_len, hidden_dim = input_seqs.shape
         device = input_seqs.device
-
-
+ 
+ 
         # Construct:
         #
         # layer=0, h=4
@@ -260,34 +282,34 @@ class MeMo(MeMoPreTrainedModel):
         # [-1, -1,  3,  7],
         # [-1,  0,  4,  8],
         # ...
-
+ 
         #    [[j * self.h ** (layer) + i for j in range(0, self.h)] for i in range(num_output_symbols)]
         #    [[j * step + i for j in range(0, self.h)] for i in range(num_output_symbols)]
-
+ 
         # Distance between selected positions
         step = h ** layer
         positions = torch.arange(seq_len, device=device)
-
+ 
         offsets = (
             torch.arange(h, device=device) - (h - 1)
         ) * step
-
+ 
         whento = positions[:, None] + offsets[None, :]
-
+ 
         # Everything before the sequence becomes PAD = -1
         whento = whento.clamp(min=-1)
         #if DEBUGGING:
         #    print("whento (selected indexes for layer ", layer, "):", whento)
-
+ 
         # Keep track of padding positions
         valid = whento != -1
-
+ 
         # Replace -1 with 0 temporarily for indexing
         gather_indices = whento.clamp(min=0)
-
+ 
         # [batch, seq_len, h, hidden_dim]
         new_seqs = input_seqs[:, gather_indices]
-
+ 
         # Padding embedding
         padding = self.encoder.weight[
             self.encoder.padding_seq_idx
@@ -299,7 +321,7 @@ class MeMo(MeMoPreTrainedModel):
             new_seqs,
             padding
         )
-
+ 
         return new_seqs
         
     
@@ -333,6 +355,12 @@ class MeMo(MeMoPreTrainedModel):
             return_dict=return_dict,
             cache_position=cache_position
         )
+ 
+    @torch.no_grad()
+    def reset_memory(self):
+        """Empty the memory of every layer together with the statistics (prior, load, norms) describing it."""
+        for layer in self.layers:
+            layer.reset_memory()
         
     
     def memorize(self, input_ids, labels_ids):
@@ -352,49 +380,20 @@ class MeMo(MeMoPreTrainedModel):
                 retreived_output_symbol_vector, max_value = self.output_encoder.decode(output_symbols) ### FMZ 2026-07-01
                 print(f"Layer {layer_level} - Output Sequence: {retreived_output_symbol_vector}")
                 
-
+ 
             ## update the input sequence for the next layer
             start = self.h**layer_level if layer_level != 0 else 0 #### WORKING
             input_sequence, update_at_layer = self.layers[layer_level].memorize(input_sequence, 
                                                                                 output_symbols, 
                                                                                 to_save_sequences=range(start, input_sequence.shape[1]), ### FMZ 2026-09-24
-                                                                                is_last=(layer_level == self.l-1))
+                                                                                is_last=(layer_level == self.l-1),
+                                                                                output_ids=labels_ids) # token id of each output symbol: updates the layer's prior
         
     
     def memorize_text(self, memo_input):
         self.memorize(memo_input['input_ids'].to(self.device), 
                       memo_input['labels'].to(self.device))
-        
-    
-    # def forget(self, input_sequence_ids, labels_ids, completely=True):
-    #     input_sequence = self.encoder.encode(input_sequence_ids)
-    #     output_symbols = self.output_encoder.encode(labels_ids) #### FMZ 2026-07-01
-
-    #     (batch_size, current_length, d) = input_sequence.shape
-    #     #assert (current_length == self.chunk_length), f'check tokenization of input text, expected row of {self.chunk_length} tokens'
-        
-    #     last_layer = self.layers[self.l-1]
-        
-        
-    #     for layer_level in range(self.l):
-    #         input_sequence = self.generate_sequences(input_seqs=input_sequence, layer=layer_level)
-    #         ## TODO how to debug now? 
-    #         input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].forget(input_sequence, 
-    #                                                                                             output_symbols, 
-    #                                                                                             completely=completely,
-    #                                                                                             is_last= (layer_level == self.l-1) )
-            
-    #         last_layer.directly_forget(seq_encoding_for_the_last_layer)
-            
-        
-        
-    
-    # def forget_text(self, memo_input, completely=True):
-    #     #for i in range(0,self.h):
-    #     self.forget(memo_input['input_ids'].to(self.device),
-    #                 memo_input['labels'].to(self.device), 
-    #                 completely=completely)
-
+ 
     
     def retrieve(self,
         input_ids: Optional[torch.Tensor] = None,
@@ -410,30 +409,30 @@ class MeMo(MeMoPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         ) -> Union[Tuple[torch.Tensor], MeMoModelOutputWithPast]:
-
+ 
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+ 
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning_once(
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
                 )
                 use_cache = False
-
+ 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
+ 
         if inputs_embeds is None:
             ### This is the specific point where padding tokens are added
             inputs_embeds = self.encoder.encode(input_ids)
             #### 
         
         seq_length = inputs_embeds.shape[0]
-
+ 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(past_seen_tokens, past_seen_tokens + seq_length, device=inputs_embeds.device)
@@ -443,7 +442,7 @@ class MeMo(MeMoPreTrainedModel):
         
         
         sequence_representation = inputs_embeds
-
+ 
         (batch_size, _, _) = sequence_representation.shape
         encoding_for_the_last_layer = torch.zeros((batch_size, self.d)).to(self.device)
         
@@ -451,22 +450,24 @@ class MeMo(MeMoPreTrainedModel):
         if self.layerized_CMM_OUT: 
             residual_stream = torch.zeros((batch_size, self.chunk_length, self.d)).to(self.device)
             residual_stream_unpacked = torch.zeros((self.l, batch_size, self.chunk_length, self.d)).to(self.device)
+            # raw (unnormalized) recall M k of every layer: what the Bayes decoders are calibrated for
+            raw_recall_unpacked = torch.zeros((self.l, batch_size, self.chunk_length, self.d)).to(self.device)
         
-
+ 
         next_decoder_cache = None
         all_hidden_tokens = () if output_hidden_token else None # token representation
         all_hidden_states = () if output_hidden_states else None # sequence representation
-
-
+ 
+ 
         for layer_level in range(self.l):
             if DEBUGGING_PROJECTION:
                 print("*"*80)
                 print(f"Layer {layer_level}")
             sequence_representation = self.generate_sequences(input_seqs=sequence_representation, layer=layer_level)
-
+ 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (sequence_representation,)
-
+ 
             
             outputs = self.layers[layer_level].retrieve(
                 sequence_representation,
@@ -491,14 +492,15 @@ class MeMo(MeMoPreTrainedModel):
                     dim=1
                 )
                 residual_stream_unpacked[layer_level] = outputs['layered_out_token']
-
-
+                raw_recall_unpacked[layer_level] = outputs['layered_out_raw']
+ 
+ 
         # Add last hidden state
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (sequence_representation,)
-
+ 
         next_cache = next_decoder_cache if use_cache else None
-
+ 
         if self.layerized_CMM_OUT: 
             last_token_representation = residual_stream
         
@@ -513,12 +515,13 @@ class MeMo(MeMoPreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             hidden_tokens=all_hidden_tokens,
+            raw_recall_unpacked=raw_recall_unpacked,
         )
-
-
+ 
+ 
 class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
-
+ 
     def __init__(self, config):
         super().__init__(config)
         self.memo = MeMo(config)
@@ -526,35 +529,54 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
         self.loss_function = MemoForCausalLMLoss 
-
-        
-
-    # def forget_text(self, memo_input, completely=True):
-    #     return self.memo.forget_text(
-    #         memo_input=memo_input,
-    #         completely=completely
-    #     )
-    
-    # def forget(self, input_ids, labels_ids, completely=True):
-    #     return self.memo.forget(
-    #         input_ids=input_ids,    
-    #         labels_ids=labels_ids,
-    #         completely=completely
-    #     )
-
+ 
         
     def memorize_text(self, memo_input):
         return self.memo.memorize_text(
             memo_input=memo_input
         )
-
+ 
             
     def memorize(self, input_ids, labels_ids):
         return self.memo.memorize_text(
             input_ids=input_ids,
             labels_ids=labels_ids
         )
-
+ 
+    @torch.no_grad()
+    def reset_memory(self):
+        self.memo.reset_memory()
+ 
+    # ------------------------------------------------------------------------------------------
+    # Bayes decoders
+    # ------------------------------------------------------------------------------------------
+    def _candidate_matrix(self):
+        """u_c: the vectors the layers store as values for token c. Assumed to be the rows of the
+        output embedding (the same table used by lm_head). Override if encode() transforms them."""
+        return self.lm_head.weight
+ 
+    def _layer_decoder_logits(self, layer, recall, E, E_sq, names):
+        """Logits over the vocabulary of one layer, for each requested decoder.
+        recall: (B, T, d) raw recall M k of this layer;  E: (V, d);  E_sq: (V,) = |u_c|^2."""
+        dot = torch.matmul(recall, E.t())                       # u_c . r              (B, T, V)
+        gamma = layer.mean_key_sq_norm()                        # mean |k|^2 of the stored keys
+        S = dot - 0.5 * gamma * E_sq                            # u_c . r - 0.5 gamma |u_c|^2
+        log_prior = layer.log_prior() if any(n.endswith("_prior") for n in names) else None
+ 
+        out = {}
+        for n in names:
+            if n == "dot_T1":
+                out[n] = dot
+            elif n == "bayes_T":
+                out[n] = layer.inverse_temperature(with_prior=False, apply_scale=False) * S
+            elif n == "bayes_T_prior":
+                out[n] = layer.inverse_temperature(with_prior=True, apply_scale=False) * S + log_prior
+            elif n == "fit_T":
+                out[n] = layer.inverse_temperature(with_prior=False, apply_scale=True) * S
+            elif n == "fit_T_prior":
+                out[n] = layer.inverse_temperature(with_prior=True, apply_scale=True) * S + log_prior
+        return out
+        
         
     def retrieve(
         self,
@@ -571,10 +593,20 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        compute_loss: Optional[bool] = False
+        compute_loss: Optional[bool] = False,
+        decoders: Optional[Sequence[str]] = None,
+        return_log_probs: Optional[bool] = False,
     ):
-
+        """decoders: which of DECODER_NAMES to compute besides "legacy" (default: all).
+        The probability distributions of all decoders are returned in `decoder_probs`
+        (name -> (B, T, V)); `logits` is still the legacy decoder's logits."""
+ 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+ 
+        names = tuple(DECODER_NAMES if decoders is None else decoders)
+        unknown = [n for n in names if n not in DECODER_NAMES]
+        if unknown:
+            raise ValueError(f"unknown decoders {unknown}; available: {DECODER_NAMES}")
         
         outputs = self.memo.retrieve(
             input_ids=input_ids,
@@ -590,25 +622,74 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             return_dict=return_dict,
             cache_position=cache_position
         )
-
+ 
+        # ---------------- legacy decoder (unchanged behaviour) ----------------
         last_token_representation = outputs['residual_stream_unpacked']   # ['last_token_representation'] # 
         lm_logits = self.lm_head.lm_logits(last_token_representation)
-
-
+        lm_logits_unpacked = lm_logits
+ 
         num_layers = self.memo.l
         decay = self.memo.lambda_val
-        
+ 
+        # Keep only the top 100 logits for each layer
+        k = 100
+        topk_values, topk_indices = torch.topk(lm_logits, k=k, dim=-1)
+ 
+        # Create a mask
+        mask = torch.zeros_like(lm_logits, dtype=torch.bool)
+        mask.scatter_(-1, topk_indices, True)
+ 
+        # Zero out all logits outside the top k
+        lm_logits = lm_logits.masked_fill(~mask, 0.0)
+ 
+        # Layer-wise weighted sum
         weights = decay ** torch.arange(
             num_layers - 1, -1, -1,
             device=lm_logits.device
         )
+        layer_weights = weights / weights.sum()          # (l,) normalized, reused by the Bayes decoders
         ## ESR 2026-09-16
         # [num_layers] -> [num_layers, 1, 1, 1]
         weights = weights.view(num_layers, 1, 1, 1)
         
         
-        lm_logits_unpacked = lm_logits
         lm_logits = (lm_logits * weights).sum(dim=0) / weights.sum()
+ 
+        # ---------------- Bayes decoders: same layer-weighted sum, on calibrated logits ----------------
+        # Every layer turns its raw recall into logits (temperature follows that layer's load, the
+        # prior is that layer's token-count prior); logits are then pooled with the same normalized
+        # layer weights as above. The weighted sum of logits equals the weighted sum of log-probabilities
+        # up to a constant per position, so the final softmax is a weighted log-linear pooling.
+        decoder_probs = {"legacy": torch.softmax(lm_logits, dim=-1)}
+        decoder_log_probs = {"legacy": torch.log_softmax(lm_logits, dim=-1)} if return_log_probs else None
+ 
+        if names:
+            E = self._candidate_matrix()
+            E_sq = E.pow(2).sum(-1)
+            raw_recall = outputs['raw_recall_unpacked']                       # (l, B, T, d)
+            pooled = {n: None for n in names}
+            for layer_level in range(num_layers):
+                per_layer = self._layer_decoder_logits(
+                    self.memo.layers[layer_level], raw_recall[layer_level], E, E_sq, names)
+                for n in names:
+                    contrib = layer_weights[layer_level] * per_layer[n]
+                    pooled[n] = contrib if pooled[n] is None else pooled[n] + contrib
+                del per_layer
+            for n in names:
+                logp = torch.log_softmax(pooled[n], dim=-1)
+                decoder_probs[n] = logp.exp()
+                if return_log_probs:
+                    decoder_log_probs[n] = logp
+ 
+        layers = self.memo.layers
+        decoder_info = dict(
+            layer_weights=layer_weights,                                                    # (l,)
+            n_pairs=torch.stack([layers[i].n_pairs for i in range(num_layers)]),            # (l,) stored pairs P
+            gamma=torch.stack([layers[i].mean_key_sq_norm() for i in range(num_layers)]),   # (l,) mean |k|^2
+            inverse_temperature=torch.stack(                                                 # (l,) theoretical beta (plain, no scale)
+                [layers[i].inverse_temperature(apply_scale=False) for i in range(num_layers)]),
+            beta_scale=torch.stack([layers[i].beta_scale for i in range(num_layers)]),       # (l, 4) fitted corrections
+        )
         
         loss = None # TODO: compute the loss function
             
@@ -617,17 +698,20 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             outputs = (lm_logits,) + outputs[1:]
             return ((loss,) + outputs) if loss is not None else outputs
             
-
+ 
         return MeMoCausalLMOutputWithPast(
             loss=loss,
             logits=lm_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             hidden_tokens=outputs.hidden_tokens,
-            lm_logits_unpacked=lm_logits_unpacked
+            lm_logits_unpacked=lm_logits_unpacked,
+            decoder_probs=decoder_probs,
+            decoder_log_probs=decoder_log_probs,
+            decoder_info=decoder_info,
         )
-
-
+ 
+ 
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -643,9 +727,11 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        compute_loss: Optional[bool] = False
+        compute_loss: Optional[bool] = False,
+        decoders: Optional[Sequence[str]] = None,
+        return_log_probs: Optional[bool] = False,
     ) -> Optional[Union[Tuple[torch.Tensor], MeMoCausalLMOutputWithPast]]:
-
+ 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
         if labels is not None and not compute_loss:
@@ -655,11 +741,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                 )
                 self.train()
             
-            return self.memorize(
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                labels=labels
-            )
+            return self.memorize(input_ids, labels_ids=labels)
         
         return self.retrieve(
             input_ids=input_ids,
@@ -674,11 +756,65 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             output_hidden_token=output_hidden_token,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            cache_position=cache_position
+            cache_position=cache_position,
+            decoders=decoders,
+            return_log_probs=return_log_probs,
         )
     
 
     ### ESR 2026-09-08
+    @torch.no_grad()
+    def _score_decoder(self, log_probs, probs, safe_labels, valid_mask, topk, vocab_size,
+                       compute_accuracy=False):
+        """Metrics of ONE decoder from its own distribution over the vocabulary.
+ 
+        log_probs, probs : (B, K, V)   log-probabilities / probabilities of the decoder
+        safe_labels      : (B, K)      labels with the masked positions replaced by a valid id
+        valid_mask       : (B, K)      False where the label is -100
+ 
+        No top-k filtering and no rescaling is applied here: calibration (NLL, entropy) is exactly
+        what separates the decoders. Ranks count ties AGAINST the decoder (a token tied with the
+        true one is ranked above it), so a decoder that cannot tell tokens apart is not credited.
+        """
+        n_valid = int(valid_mask.sum().item())
+        denom = max(n_valid, 1)
+ 
+        logp_true = torch.gather(log_probs, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)  # (B, K)
+ 
+        def masked_mean(x):
+            return (torch.where(valid_mask, x, torch.zeros_like(x)).sum() / denom).item()
+ 
+        avg_nll = masked_mean(-logp_true)
+ 
+        # rank of the true token: 0 = it is the arg-max
+        ref = logp_true.unsqueeze(-1)
+        rank0 = (log_probs > ref).sum(dim=-1) + (log_probs == ref).sum(dim=-1) - 1                # (B, K)
+ 
+        entropy = -torch.special.xlogy(probs, probs).sum(dim=-1)                                  # (B, K)
+        confidence = probs.max(dim=-1).values                                                     # (B, K)
+ 
+        result = dict(
+            avg_nll=avg_nll,
+            ppl=float(torch.exp(torch.tensor(avg_nll)).item()) if avg_nll < 80 else float("inf"),
+            avg_entropy=masked_mean(entropy),        # ~ avg_nll for a calibrated decoder
+            avg_confidence=masked_mean(confidence),  # mean max-probability; ~ top-1 accuracy if calibrated
+            topk_acc={int(k): ((rank0 < k) & valid_mask).sum().item() / denom for k in topk},
+            accuracy=((rank0 == 0) & valid_mask).sum().item() / denom,
+            num_tokens=n_valid,
+        )
+ 
+        if compute_accuracy:
+            flat_valid = valid_mask.flatten()
+            valid_labels = safe_labels.flatten()[flat_valid]
+            valid_correct = (rank0 == 0).flatten()[flat_valid]
+            target_counts = torch.bincount(valid_labels, minlength=vocab_size)
+            correct_counts = torch.bincount(valid_labels[valid_correct], minlength=vocab_size)
+            ids = torch.nonzero(target_counts, as_tuple=True)[0].tolist()
+            tc, cc = target_counts.tolist(), correct_counts.tolist()
+            result['token_stats'] = {tid: {'target_count': tc[tid], 'correct_count': cc[tid]} for tid in ids}
+        return result
+ 
+ 
     def forward_with_loss_simple(
         self,
         batch_inputs,
@@ -686,33 +822,28 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         compute_accuracy=False,
         starting_point=9,
         tokenizer=None,
+        decoders: Optional[Sequence[str]] = None,
+        topk: Sequence[int] = (1, 5, 10, 100),
     ) -> Optional[Union[Tuple[torch.Tensor], "MeMoCausalLMOutputWithPast"]]:
         """
         Simplified forward_with_loss for models whose forward() already scores an
-        entire sequence in one call.
-     
-        Given batch_inputs['input_ids'] and batch_inputs['labels'], both (B, seq_len),
-        a single self.forward(input_ids=input_ids, labels=labels) call returns
-        outputs.logits of shape (B, seq_len, vocab_size), where logits[:, p, :] is
-        the model's prediction distribution for the token at position p, aligned
-        directly with labels[:, p] (no windowing, no chunk_length, no shifting).
-     
-        That means the entire per-token forward-pass loop from the windowed version
-        is unnecessary: there's nothing left to parallelize across calls, because
-        there's only one call. What's left is just vectorized bookkeeping (loss,
-        accuracy, token_stats, padding analysis, perplexity), computed once over
-        the full (B, seq_len, vocab) tensor instead of accumulated across many
-        micro-batches -- so all the per-iteration accumulator logic (total_loss +=,
-        total_nll_sum +=, target_counts_total +=, ...) collapses into single
-        (non-accumulating) computations.
-     
-        `starting_point` still lets you exclude the first N positions from the
-        loss/accuracy/perplexity computation (e.g. if the model's predictions are
-        unreliable before it has seen enough context), but no longer has anything
-        to do with a context-window size -- it's just an index offset now.
-     
-        -100 in labels still marks positions to exclude from every statistic,
-        exactly as before.
+        entire sequence in one call (see the original docstring: logits[:, p, :] is aligned
+        with labels[:, p]; -100 in labels excludes a position from every statistic).
+ 
+        Decoders. The model returns, besides the legacy `logits`, one probability distribution
+        per decoder (outputs.decoder_probs / decoder_log_probs: name -> (B, seq_len, V)).
+        `decoders` selects which of the Bayes decoders to compute (None = all; "legacy" is always
+        there). Results:
+ 
+          * The top-level fields of accuracy_results / batch_debug (perplexity, avg_nll, accuracy,
+            loss, token_stats, predictions, ...) are the LEGACY decoder, computed exactly as before
+            (top-50 filtering, fill value and x10 included), so existing callers are unaffected.
+          * accuracy_results['decoders'][name] and batch_debug['decoders'][name] give, for EVERY
+            decoder (legacy included), metrics computed from its own distribution with no
+            filtering or rescaling: avg_nll, ppl, avg_entropy, avg_confidence, accuracy (top-1),
+            topk_acc {k: accuracy}, num_tokens (and token_stats when compute_accuracy).
+            The legacy entry here is the unfiltered legacy distribution, so it is directly
+            comparable with the others; it will differ from the top-level (filtered) legacy numbers.
         """
         starting_point = max(2, starting_point)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -730,7 +861,9 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             input_ids=input_ids,
             labels=labels,
             return_dict=return_dict,
-            compute_loss=True
+            compute_loss=True,
+            decoders=decoders,
+            return_log_probs=True,      # NLL and ranks are computed from log-probabilities (no underflow)
         )
         logits = outputs.logits  # (B, seq_len, vocab_size)
         lm_logits = logits.detach()
@@ -827,6 +960,24 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         accuracy_results['perplexity'] = perplexity_value
         accuracy_results['avg_nll'] = avg_nll_value
         accuracy_results['num_tokens'] = num_tokens_predicted
+ 
+        # ---- Per-decoder metrics (every distribution returned by the model) ---------------
+        # _labels contains -100 at masked positions: use a clamped copy for gather/decoding only
+        pad_id_for_safe = getattr(self.config, 'pad_token_id', 0) or 0
+        safe_labels_all = torch.where(
+            _labels == -100, torch.full_like(_labels, pad_id_for_safe), _labels
+        )
+        decoder_log_probs = {}
+        decoder_results = {}
+        if outputs.decoder_log_probs is not None:
+            for name, lp in outputs.decoder_log_probs.items():
+                lp = lp.detach()[:, starting_point:, :]
+                pr = outputs.decoder_probs[name].detach()[:, starting_point:, :]
+                decoder_log_probs[name] = lp
+                decoder_results[name] = self._score_decoder(
+                    lp, pr, safe_labels_all, valid_mask, topk, vocab_size, compute_accuracy
+                )
+        accuracy_results['decoders'] = decoder_results
      
         # ---- Optional debug info (only built if a tokenizer is supplied) --------------
         debug_predictions = list()
@@ -886,6 +1037,17 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             exp_max = exp_lm_logits.max(dim=-1).values.cpu().numpy().tolist()
      
             loss_scalar = loss.detach().cpu().numpy().tolist()  # mean loss over the whole sequence/batch
+ 
+            # per-decoder debug: top-5 tokens with their probabilities, and the probability of the label
+            dec_dbg = {}
+            for name, lp in decoder_log_probs.items():
+                t5 = torch.topk(lp, k=5, dim=-1)
+                true_lp = torch.gather(lp, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+                dec_dbg[name] = dict(
+                    top_ids=t5.indices.cpu().numpy().tolist(),            # (B, K, 5)
+                    top_probs=t5.values.exp().cpu().numpy().tolist(),      # (B, K, 5)
+                    expected_prob=true_lp.exp().cpu().numpy().tolist(),    # (B, K)
+                )
      
             for local_p in range(kept_len):
                 i_value = kept_positions[local_p]
@@ -928,6 +1090,18 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                             batch_debug_info[key] = [str(v) if str(v) in ['inf', '-inf'] else v for v in value]
                     elif isinstance(value, float) and (str(value) in ['inf', '-inf']):
                         batch_debug_info[key] = str(value)
+ 
+                # per-decoder predictions at this position (added after the inf/-inf sanitization,
+                # probabilities are finite)
+                batch_debug_info['decoders'] = {
+                    name: {
+                        'pred_tokens': [tokenizer.convert_ids_to_tokens(d['top_ids'][b][local_p][0]) for b in range(batch_size)],
+                        'expected_label_prob': [d['expected_prob'][b][local_p] for b in range(batch_size)],
+                        'top_predicted_tokens': [tokenizer.convert_ids_to_tokens(d['top_ids'][b][local_p]) for b in range(batch_size)],
+                        'top_predicted_tokens_prob': [d['top_probs'][b][local_p] for b in range(batch_size)],
+                    }
+                    for name, d in dec_dbg.items()
+                }
                 debug_predictions.append(batch_debug_info)
      
         batch_debug = dict(
@@ -937,6 +1111,10 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             accuracy=accuracy_results['accuracy'] if compute_accuracy else None,
             correct_tokens=accuracy_results['correct_tokens'] if compute_accuracy else None,
             total_tokens=accuracy_results['tot_tokens'] if compute_accuracy else None,
+            decoders={
+                name: {k: v for k, v in res.items() if k != 'token_stats'}
+                for name, res in decoder_results.items()
+            },
             predictions=debug_predictions
         )
      
@@ -946,4 +1124,5 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             past_key_values=None,
             hidden_states=None,
             hidden_tokens=None,
+            decoder_info=outputs.decoder_info,
         ), accuracy_results, batch_debug
