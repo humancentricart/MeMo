@@ -2,10 +2,11 @@
 Saturation evaluation for MeMoLayer correlation matrix memories, using the
 REAL keys/values produced upstream (input_sequence / output_symbols).
 
-Disk layout (one folder per layer, one file pair per memorize() call)
+Disk layout (one folder per layer, tensor files per memorize() call)
 ---------------------------------------------------------------------
     root/layer_{l}/batch_000000.keys.pt   input_sequence  (B, L, h, d)   shapes untouched
     root/layer_{l}/batch_000000.vals.pt   output_symbols  (B, L, d)
+    root/layer_{l}/batch_000000.ids.pt    output_ids      (B, L)         when supplied
     root/layer_{l}/manifest.jsonl         one line per batch: shapes, to_save_sequences, n_pairs, is_last
     root/layer_{l}/candidates.pt          (created on first decoding run) distinct value vectors + ids
 
@@ -15,10 +16,12 @@ Disk layout (one folder per layer, one file pair per memorize() call)
     for l, layer in enumerate(self.layers):
         rec.attach(layer, l)
     ...  # run your normal loop: self.layers[l].memorize(input_sequence, output_symbols,
-         #                                  to_save_sequences=range(start, L), is_last=...)
+         #                                  to_save_sequences=range(start, L), is_last=...,
+         #                                  output_ids=output_ids)
     rec.detach_all()
 
-   (or call rec.record(layer_level, input_sequence, output_symbols, to_save_sequences, is_last)
+   (or call rec.record(layer_level, input_sequence, output_symbols,
+                       to_save_sequences, is_last, output_ids)
     explicitly, wherever you prefer)
 
 2) REPLAY + EVALUATE (per layer, possibly in another process)
@@ -143,8 +146,8 @@ def _n_selected(d, L: int) -> int:
 # --------------------------------------------------------------------------- #
 class BatchRecorder:
     """
-    Saves, at every memorize() invocation, the exact input_sequence, output_symbols
-    and to_save_sequences, one file pair per call, grouped by layer level.
+    Saves, at every memorize() invocation, the input_sequence, output_symbols,
+    output_ids, and to_save_sequences, grouped by layer level.
     Resumable: if the folder already has batches, numbering continues.
     """
 
@@ -182,7 +185,8 @@ class BatchRecorder:
     # ---- public API -------------------------------------------------------
     @torch.no_grad()
     def record(self, layer_level: int, input_sequence: torch.Tensor, output_symbols: torch.Tensor,
-               to_save_sequences=None, is_last: bool = False) -> Optional[int]:
+               to_save_sequences=None, is_last: bool = False,
+               output_ids: Optional[torch.Tensor] = None) -> Optional[int]:
         i = self._next_idx(layer_level)
         if self.max_batches is not None and i >= self.max_batches:
             return None
@@ -196,9 +200,13 @@ class BatchRecorder:
         k, v = self._pack(input_sequence), self._pack(output_symbols)
         torch.save(k, d / f"batch_{i:06d}.keys.pt")
         torch.save(v, d / f"batch_{i:06d}.vals.pt")
+        if output_ids is not None:
+            ids = output_ids.detach().cpu().contiguous().clone()
+            torch.save(ids, d / f"batch_{i:06d}.ids.pt")
         entry = dict(idx=i, keys_shape=list(k.shape), vals_shape=list(v.shape),
                      dtype=str(input_sequence.dtype), saved_dtype=str(k.dtype),
-                     to_save=ts, n_pairs=n_pairs, is_last=bool(is_last))
+                     ids_saved=output_ids is not None, to_save=ts,
+                     n_pairs=n_pairs, is_last=bool(is_last))
         with open(d / "manifest.jsonl", "a") as f:
             f.write(json.dumps(entry) + "\n")
         self._counters[layer_level] = i + 1
@@ -212,10 +220,14 @@ class BatchRecorder:
         recorder = self
 
         @functools.wraps(original)
-        def wrapped(input_sequence, output_symbols, to_save_sequences=None, is_last=False):
-            recorder.record(layer_level, input_sequence, output_symbols, to_save_sequences, is_last)
+        def wrapped(input_sequence, output_symbols, to_save_sequences=None,
+            is_last=False, output_ids=None):
+            recorder.record(layer_level, input_sequence, output_symbols,
+                            to_save_sequences, is_last, output_ids)
             return original(input_sequence, output_symbols,
-                            to_save_sequences=to_save_sequences, is_last=is_last)
+                            to_save_sequences=to_save_sequences,
+                            is_last=is_last,
+                            output_ids=output_ids)
 
         layer.memorize = wrapped
         self._originals[layer_level] = (layer, original)
@@ -266,9 +278,16 @@ class BatchStore:
         x = torch.load(self.dir / f"batch_{i:06d}.vals.pt", map_location="cpu")
         return self._cast(x, device, dtype)  # (B, L, d)
 
+    def load_ids(self, i, device="cpu"):
+        path = self.dir / f"batch_{i:06d}.ids.pt"
+        if not path.exists():
+            return None
+        x = torch.load(path, map_location="cpu")
+        return x.to(device)
+
     def load(self, i, device="cpu", dtype=torch.float32):
         return (self.load_keys(i, device, dtype), self.load_values(i, device, dtype),
-                self.to_save(i), self.is_last(i))
+                self.load_ids(i, device), self.to_save(i), self.is_last(i))
 
 
 def default_checkpoints(max_batches: int, n_points: int = 8) -> List[int]:
@@ -417,8 +436,9 @@ class CMMSaturationEvaluator:
         if n_batches < self.n_batches_stored:
             raise ValueError("cannot un-memorize; call reset() first")
         for i in range(self.n_batches_stored, n_batches):
-            k, v, ts, is_last = self.store.load(i, self.device, self.dtype)
-            self.layer.memorize(k, v, to_save_sequences=ts, is_last=is_last)
+            k, v, output_ids, ts, is_last = self.store.load(i, self.device, self.dtype)
+            self.layer.memorize(k, v, to_save_sequences=ts, is_last=is_last,
+                                output_ids=output_ids)
             self.n_pairs_stored += self.store.n_pairs(i)
         self.n_batches_stored = n_batches
 
@@ -799,7 +819,10 @@ def plot_sweep(rows: List[Dict], path: Optional[str] = None):
 
     P = [r["P"] for r in rows]
     has_dec = all(r.get("dec") for r in rows)
-    nrows = 2 if has_dec else 1
+    ks = rows[0]["dec"]["topk"] if has_dec else []
+    ks_gt1 = [k for k in ks if k > 1]
+    n_topk_rows = math.ceil(len(ks_gt1) / 3)
+    nrows = 2 + n_topk_rows if has_dec else 1
     fig, axes = plt.subplots(nrows, 3, figsize=(15, 4 * nrows), squeeze=False)
 
     # ---- row 1: recall quality (unchanged) --------------------------------
@@ -821,7 +844,6 @@ def plot_sweep(rows: List[Dict], path: Optional[str] = None):
     # ---- row 2: decoders ---------------------------------------------------
     if has_dec:
         a = axes[1]
-        ks = rows[0]["dec"]["topk"]
         dec = lambda nm, key: [r["dec"]["decoders"][nm][key] for r in rows]
         label = {"dot_T1": "dot product, T=1 (current)",
                  "bayes_T": "Bayes temperature",
@@ -850,35 +872,50 @@ def plot_sweep(rows: List[Dict], path: Optional[str] = None):
                  ylim=(0, 1.3 * max(max(nll_u), max(nll_pr))))
         a[0].legend(fontsize=6)
 
-        # (b) accuracy of the decoders (no random baseline; linear y axis to resolve values near 1)
-        a[1].plot(P, [r["top1_acc"] for r in rows], "k:", label="top-1 cosine cleanup (stored bank)")
+        # (b) separate accuracy plot for each requested top-k
+        topk_axes = [a[2]]
+        for row_idx in range(2, nrows):
+            topk_axes.extend(axes[row_idx])
+
+        top1_ax = topk_axes[0]
+        top1_ax.plot(P, [r["top1_acc"] for r in rows], "k:",
+                     label="top-1 cosine cleanup (stored bank)")
         for nm in ("dot_T1", "bayes_T", "bayes_T_prior", "fit_T_prior",
                    "white_T", "white_T_prior", "fit_white_T_prior"):
-            a[1].plot(P, dec(nm, "top1"), sty[nm], color=col[nm], label=f"top-1 {label[nm]}")
-        ks_gt1 = [k for k in ks if k > 1]
-        kcols = plt.cm.plasma(np.linspace(0.1, 0.8, max(len(ks_gt1), 1)))
-        for k, kc in zip(ks_gt1, kcols):
-            a[1].plot(P, dec("fit_T_prior", f"top{k}"), "s--", color=kc, alpha=0.8,
-                      label=f"top-{k} fitted T + prior")
-            a[1].plot(P, dec("fit_white_T_prior", f"top{k}"), "v-", color=kc,
-                      label=f"top-{k} whitened, fitted T + prior")
-        a[1].set(xscale="log", xlabel="stored pairs P", ylabel="accuracy")
-        a[1].set_ylim(top=1.01)  # lower limit is chosen automatically from the data
-        a[1].legend(fontsize=5)
+            top1_ax.plot(P, dec(nm, "top1"), sty[nm], color=col[nm],
+                         label=f"top-1 {label[nm]}")
+        top1_ax.set(xscale="log", xlabel="stored pairs P", ylabel="accuracy",
+                    title="Top-1 accuracy")
+        top1_ax.set_ylim(top=1.01)  # lower limit is chosen automatically from the data
+        top1_ax.legend(fontsize=5)
+
+        for ax, k in zip(topk_axes[1:], ks_gt1):
+            ax.plot(P, dec("fit_T_prior", f"top{k}"), "s-",
+                    label="fitted T + prior")
+            ax.plot(P, dec("fit_white_T_prior", f"top{k}"), "v-",
+                    label="whitened, fitted T + prior")
+            ax.set(xscale="log", xlabel="stored pairs P", ylabel="accuracy",
+                   title=f"Top-{k} accuracy")
+            ax.set_ylim(top=1.01)
+            ax.legend(fontsize=7)
+
+        for ax in topk_axes[1 + len(ks_gt1):]:
+            ax.set_visible(False)
 
         # (c) inverse temperature: theory vs fitted
-        a[2].plot(P, [r["dec"]["beta_theory"] for r in rows], "--", color="C0", label=r"theory $\gamma/s^2$")
-        a[2].plot(P, [r["dec"]["beta_fit"] for r in rows], "o-", color="C1", label="fitted (no prior)")
-        a[2].plot(P, [r["dec"]["beta_fit_prior"] for r in rows], "s-", color="C2", label="fitted (with prior)")
-        a[2].plot(P, [r["dec"]["beta_theory_white"] for r in rows], "--", color="C5",
+        beta_ax = a[1]
+        beta_ax.plot(P, [r["dec"]["beta_theory"] for r in rows], "--", color="C0", label=r"theory $\gamma/s^2$")
+        beta_ax.plot(P, [r["dec"]["beta_fit"] for r in rows], "o-", color="C1", label="fitted (no prior)")
+        beta_ax.plot(P, [r["dec"]["beta_fit_prior"] for r in rows], "s-", color="C2", label="fitted (with prior)")
+        beta_ax.plot(P, [r["dec"]["beta_theory_white"] for r in rows], "--", color="C5",
                   label=r"whitened theory $\gamma/\alpha$")
-        a[2].plot(P, [r["dec"]["beta_fit_white"] for r in rows], "^-", color="C8",
+        beta_ax.plot(P, [r["dec"]["beta_fit_white"] for r in rows], "^-", color="C8",
                   label="whitened fitted (no prior)")
-        a[2].plot(P, [r["dec"]["beta_fit_white_prior"] for r in rows], "v-", color="C9",
+        beta_ax.plot(P, [r["dec"]["beta_fit_white_prior"] for r in rows], "v-", color="C9",
                   label="whitened fitted (with prior)")
-        a[2].set(xscale="log", yscale="log", xlabel="stored pairs P",
+        beta_ax.set(xscale="log", yscale="log", xlabel="stored pairs P",
                  ylabel=r"inverse temperature $\beta$")
-        a[2].legend(fontsize=7)
+        beta_ax.legend(fontsize=7)
 
     fig.tight_layout()
     if path:
