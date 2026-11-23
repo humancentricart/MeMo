@@ -170,8 +170,15 @@ class MeMoPreTrainedModel(PreTrainedModel):
 #   bayes_T_prior  : bayes_T + log pi_c                              prior from the layer's token counts
 #   fit_T          : same as bayes_T with the layer's fitted beta_scale (plain, no prior)
 #   fit_T_prior    : same as bayes_T_prior with the layer's fitted beta_scale (plain, prior)
+#   white_T        : whitened theoretical temperature
+#   white_T_prior  : whitened theoretical temperature + prior
+#   fit_white_T    : whitened with the layer's fitted beta_scale (no prior)
+#   fit_white_T_prior : whitened with fitted beta_scale + prior
 # fit_* coincide with bayes_* until MeMoLayer.set_beta_scale(...) is called with the fitted ratio.
-DECODER_NAMES = ("dot_T1", "bayes_T", "bayes_T_prior", "fit_T", "fit_T_prior")
+DECODER_NAMES = (
+    "dot_T1", "bayes_T", "bayes_T_prior", "fit_T", "fit_T_prior",
+    "white_T", "white_T_prior", "fit_white_T", "fit_white_T_prior",
+)
  
  
 class MeMo(MeMoPreTrainedModel):
@@ -190,6 +197,7 @@ class MeMo(MeMoPreTrainedModel):
             compositionOp = CompositionOp[config.compositionOp.upper()],
             padding_vector_component_values=config.padding_vector_component_values if config.padding_vector_component_values is not None else 0,
             prior_smoothing=getattr(config, "prior_smoothing", 1.0),
+            whitening_ridge=getattr(config, "whitening_ridge", 1e-3),
         )
         
         self.gradient_checkpointing = False
@@ -212,6 +220,7 @@ class MeMo(MeMoPreTrainedModel):
                 padding_vector_component_values=0,
                 lambda_val=0.9,
                 prior_smoothing=1.0,
+                whitening_ridge=1e-3,
         ): 
         
         self.d = inner_dim
@@ -222,6 +231,7 @@ class MeMo(MeMoPreTrainedModel):
         self.lambda_val = lambda_val
         self.compositionOp = compositionOp
         self.padding_vector_component_values = padding_vector_component_values
+        self.whitening_ridge = whitening_ridge
         self.layerized_CMM_OUT = True        
         
         #### FMZ 2026-07-01 - Trying with different encodings for input and for unencoding 
@@ -555,13 +565,24 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         output embedding (the same table used by lm_head). Override if encode() transforms them."""
         return self.lm_head.weight
  
-    def _layer_decoder_logits(self, layer, recall, E, E_sq, names):
+    def _layer_decoder_logits(self, layer, recall, E, E_sq, names, whitening_ridge):
         """Logits over the vocabulary of one layer, for each requested decoder.
         recall: (B, T, d) raw recall M k of this layer;  E: (V, d);  E_sq: (V,) = |u_c|^2."""
         dot = torch.matmul(recall, E.t())                       # u_c . r              (B, T, V)
         gamma = layer.mean_key_sq_norm()                        # mean |k|^2 of the stored keys
         S = dot - 0.5 * gamma * E_sq                            # u_c . r - 0.5 gamma |u_c|^2
         log_prior = layer.log_prior() if any(n.endswith("_prior") for n in names) else None
+
+        whitened_names = {
+            "white_T", "white_T_prior", "fit_white_T", "fit_white_T_prior"
+        }
+        Cinv = None
+        Sw = None
+        if whitened_names.intersection(names):
+            Cinv = layer.whitening_inverse(E, ridge=whitening_ridge)
+            E_whitened = E @ Cinv
+            whitened_dot = torch.matmul(recall, E_whitened.t())
+            Sw = whitened_dot - 0.5 * gamma * torch.sum(E_whitened * E, dim=-1)
  
         out = {}
         for n in names:
@@ -575,6 +596,14 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                 out[n] = layer.inverse_temperature(with_prior=False, apply_scale=True) * S
             elif n == "fit_T_prior":
                 out[n] = layer.inverse_temperature(with_prior=True, apply_scale=True) * S + log_prior
+            elif n == "white_T":
+                out[n] = layer.inverse_temperature(whitened=True, with_prior=False, apply_scale=False) * Sw
+            elif n == "white_T_prior":
+                out[n] = layer.inverse_temperature(whitened=True, with_prior=True, apply_scale=False) * Sw + log_prior
+            elif n == "fit_white_T":
+                out[n] = layer.inverse_temperature(whitened=True, with_prior=False, apply_scale=True) * Sw
+            elif n == "fit_white_T_prior":
+                out[n] = layer.inverse_temperature(whitened=True, with_prior=True, apply_scale=True) * Sw + log_prior
         return out
         
         
@@ -632,8 +661,8 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         decay = self.memo.lambda_val
  
         # Keep only the top 100 logits for each layer
-        k = 100
-        topk_values, topk_indices = torch.topk(lm_logits, k=k, dim=-1)
+        k = min(100, lm_logits.shape[-1])
+        topk_values, topk_indices = torch.topk(lm_logits, k=min(k, lm_logits.shape[-1]), dim=-1)
  
         # Create a mask
         mask = torch.zeros_like(lm_logits, dtype=torch.bool)
@@ -670,7 +699,13 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             pooled = {n: None for n in names}
             for layer_level in range(num_layers):
                 per_layer = self._layer_decoder_logits(
-                    self.memo.layers[layer_level], raw_recall[layer_level], E, E_sq, names)
+                    self.memo.layers[layer_level],
+                    raw_recall[layer_level],
+                    E,
+                    E_sq,
+                    names,
+                    self.memo.whitening_ridge,
+                )
                 for n in names:
                     contrib = layer_weights[layer_level] * per_layer[n]
                     pooled[n] = contrib if pooled[n] is None else pooled[n] + contrib
@@ -688,6 +723,8 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             gamma=torch.stack([layers[i].mean_key_sq_norm() for i in range(num_layers)]),   # (l,) mean |k|^2
             inverse_temperature=torch.stack(                                                 # (l,) theoretical beta (plain, no scale)
                 [layers[i].inverse_temperature(apply_scale=False) for i in range(num_layers)]),
+            inverse_temperature_white=torch.stack(
+                [layers[i].inverse_temperature(whitened=True, apply_scale=False) for i in range(num_layers)]),
             beta_scale=torch.stack([layers[i].beta_scale for i in range(num_layers)]),       # (l, 4) fitted corrections
         )
         
@@ -877,7 +914,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         kept_positions = list(range(starting_point, seq_len))
      
         # top-k filtering (same as original): keep only the top-50 logits per position
-        top_k = torch.topk(lm_logits, k=50, dim=-1)
+        top_k = torch.topk(lm_logits, k=min(50, lm_logits.shape[-1]), dim=-1)
         mask = torch.full_like(lm_logits, -12.0)
         mask.scatter_(dim=-1, index=top_k.indices, src=top_k.values)
         lm_logits = mask * 10
@@ -982,10 +1019,10 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
         # ---- Optional debug info (only built if a tokenizer is supplied) --------------
         debug_predictions = list()
         if tokenizer is not None:
-            top_k5 = torch.topk(lm_logits, k=5, dim=-1)
+            top_k5 = torch.topk(lm_logits, k=min(5, lm_logits.shape[-1]), dim=-1)
             _lm_logits_softmax = torch.nn.functional.softmax(lm_logits, dim=-1)
             argmax_value_soft = torch.max(_lm_logits_softmax, dim=-1)
-            top_k_softmax = torch.topk(_lm_logits_softmax, k=5, dim=-1)
+            top_k_softmax = torch.topk(_lm_logits_softmax, k=min(5, lm_logits.shape[-1]), dim=-1)
      
             # _labels contains -100 at masked positions, which is not a valid vocab
             # index / token id -- gather() and tokenizer decoding both require real
@@ -1041,7 +1078,7 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             # per-decoder debug: top-5 tokens with their probabilities, and the probability of the label
             dec_dbg = {}
             for name, lp in decoder_log_probs.items():
-                t5 = torch.topk(lp, k=5, dim=-1)
+                t5 = torch.topk(lp, k=min(5, lm_logits.shape[-1]), dim=-1)
                 true_lp = torch.gather(lp, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
                 dec_dbg[name] = dict(
                     top_ids=t5.indices.cpu().numpy().tolist(),            # (B, K, 5)

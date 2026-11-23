@@ -424,6 +424,7 @@ class CMMSaturationEvaluator:
     @torch.no_grad()
     def reset(self):
         self.layer.CMM_OUT.reset_parameters()
+        self.layer.reset_statistics()
         self.n_batches_stored = 0
         self.n_pairs_stored = 0
 

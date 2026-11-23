@@ -317,6 +317,38 @@ class MeMoLayer(Module):
     def load(self):
         """alpha = (P - 1) / d, the load seen by one probe (the P - 1 other pairs make the noise)."""
         return ((self.n_pairs.double() - 1).clamp_min(1.0) / self.d).to(torch.float32)
+
+    @torch.no_grad()
+    def whitening_inverse(self, candidates, ridge=1e-3):
+        """Ridge-regularised inverse of the count-weighted second-moment matrix C.
+
+        C = sum_c (count_c / P) u_c u_c^T, where u_c is a candidate value vector.
+        """
+        if candidates.shape[0] != self.num_embeddings:
+            raise ValueError(
+                f"candidate matrix has {candidates.shape[0]} rows, "
+                f"but num_embeddings is {self.num_embeddings}"
+            )
+
+        counts = self.token_counts.to(torch.float64)
+        p = counts.sum()
+        d = candidates.shape[-1]
+        if p <= 0:
+            return torch.eye(d, dtype=candidates.dtype, device=candidates.device)
+
+        weights = counts / p
+        C = torch.zeros(d, d, dtype=torch.float64, device=candidates.device)
+        Ud = candidates.detach().to(torch.float64)
+        C = Ud.T @ (weights[:, None] * Ud)
+        C = 0.5 * (C + C.T)
+
+        tr = C.diagonal().sum()
+        if not torch.isfinite(tr) or tr <= 0:
+            return torch.eye(d, dtype=candidates.dtype, device=candidates.device)
+        lam = float(ridge) * tr / d
+        Cinv = torch.linalg.inv(C + lam * torch.eye(d, dtype=torch.float64, device=candidates.device))
+        Cinv = 0.5 * (Cinv + Cinv.T)
+        return Cinv.to(dtype=candidates.dtype)
  
     def inverse_temperature(self, whitened=False, with_prior=False, apply_scale=True):
         """Theoretical inverse temperature beta of the softmax over the raw recall r = M k.
