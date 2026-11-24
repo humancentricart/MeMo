@@ -55,7 +55,7 @@ class Evaluation:
                 
         count = 0
         correct = 0
-        max_length = tokenizer.max_length
+        max_length = tokenizer.model_max_length
         (batch_size, number_of_tokens) = input_ids.shape
 
         #print(f"(batch_size, number_of_tokens) = {(batch_size, number_of_tokens)}")

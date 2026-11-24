@@ -26,6 +26,16 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+LearningEvaluation/mem_curve*
+LearningEvaluation/memo_*
+LearningEvaluation/models*/*
+LearningEvaluation/original_training_data/*
+LearningEvaluation/old_mem_curve/*
+LearningEvaluation/results_mem_curve_eval/*
+LearningEvaluation/results_ppl_train/*
+LearningEvaluation/tracker_memo_trained/*
+LearningEvaluation/LearningEvaluation/*
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -35,6 +45,15 @@ MANIFEST
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
+
+memo_env/
+memo_env/*
+
+MemoExp/
+MemoExp/*
+tok_exp/
+tok_exp/*
+
 
 # Unit test / coverage reports
 htmlcov/
